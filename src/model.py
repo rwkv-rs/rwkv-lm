@@ -82,7 +82,51 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
         r,w,k,v,a,b = [i.view(B,T,HN//64,64) for i in [r,w,k,v,a,b]] # can change 64 to your HEAD_SIZE. have to hard-code the number here, or pytorch will complain
         return RWKV7_CLAMPW_CUDA_OP.apply(r,w,k,v,a,b).view(B,T,HN)
 
-########################################################################################################
+    if os.environ.get("RWKV_TRAIN_TYPE") == "infctx":
+        RWKV7_STATEPASSING_CLAMPW_OP = torch.ops.rwkv7_statepassing_clampw
+        load(name="rwkv7_statepassing_clampw", sources=['cuda/rwkv7_statepassing_clampw.cu', 'cuda/rwkv7_statepassing_clampw.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+
+        class RWKV7_STATEPASSING_CLAMPW_CUDA_OP(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx,s0,r,w,k,v,a,b):
+                B,T,H,N = r.shape
+                assert T%CHUNK_LEN == 0 # if T%CHUNK_LEN != 0: pad your input to T%CHUNK_LEN == 0, or change CHUNK_LEN (will be slower)
+                assert s0.dtype == torch.float32
+                assert all(i.dtype==torch.bfloat16 for i in [r,w,k,v,a,b])
+                assert s0.is_contiguous()
+                assert all(i.is_contiguous() for i in [r,w,k,v,a,b])
+                y = torch.empty_like(v)
+                sT = torch.empty_like(s0)
+                s = torch.empty(B,H,T//CHUNK_LEN,N,N, dtype=torch.float32,device=w.device)
+                sa = torch.empty(B,T,H,N, dtype=torch.float32,device=w.device)
+                RWKV7_STATEPASSING_CLAMPW_OP.forward(s0,r,w,k,v,a,b,y,sT,s,sa)
+                ctx.save_for_backward(r,w,k,v,a,b,s,sa)
+                ctx.state_shape = s0.shape
+                return y,sT
+
+            @staticmethod
+            def backward(ctx,dy,dsT):
+                assert all(i.dtype==torch.bfloat16 for i in [dy])
+                assert all(i.is_contiguous() for i in [dy])
+                r,w,k,v,a,b,s,sa = ctx.saved_tensors
+                if dsT is None:
+                    dsT = torch.zeros(ctx.state_shape, dtype=torch.float32, device=dy.device)
+                dsT = dsT.contiguous().float()
+                ds0 = torch.empty(ctx.state_shape, dtype=torch.float32, device=dy.device)
+                dr,dw,dk,dv,da,db = [torch.empty_like(x) for x in [r,w,k,v,a,b]]
+                RWKV7_STATEPASSING_CLAMPW_OP.backward(r,w,k,v,a,b,dy,dsT,s,sa,ds0,dr,dw,dk,dv,da,db)
+                return ds0,dr,dw,dk,dv,da,db
+
+        def RWKV7_STATEPASSING_CLAMPW_CUDA(s0,r,w,k,v,a,b):
+            B,T,HN = r.shape
+            r,w,k,v,a,b = [i.contiguous().view(B,T,HN//64,64) for i in [r,w,k,v,a,b]]
+            y,sT = RWKV7_STATEPASSING_CLAMPW_CUDA_OP.apply(s0.contiguous(),r,w,k,v,a,b)
+            return y.view(B,T,HN),sT
+    else:
+        def RWKV7_STATEPASSING_CLAMPW_CUDA(s0,r,w,k,v,a,b):
+            raise RuntimeError("RWKV infctx requires RWKV_TRAIN_TYPE=infctx before importing src.model.")
+
+	########################################################################################################
 
 load(name="rwkv7_cmix_bf16_v5", sources=["cuda/rwkv7_cmix_bf16_v5.cpp","cuda/rwkv7_cmix_bf16_v5.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
@@ -114,6 +158,38 @@ class _CmixLayerV2Fn(torch.autograd.Function):
         )
         return grad_x, grad_x_k, grad_key_weight, grad_value_weight
 
+
+class _CmixStateLayerV2Fn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, shift_state, x_k, key_weight, value_weight):
+        out, mixed, act, new_shift_state = torch.ops.rwkv7_cmix_bf16_v5.state_forward(
+            x.contiguous(),
+            shift_state.contiguous(),
+            x_k.contiguous(),
+            key_weight.contiguous(),
+            value_weight.contiguous(),
+        )
+        ctx.save_for_backward(x, shift_state, x_k, key_weight, value_weight, mixed, act)
+        return out, new_shift_state
+
+    @staticmethod
+    def backward(ctx, grad_out, grad_new_shift_state):
+        x, shift_state, x_k, key_weight, value_weight, mixed, act = ctx.saved_tensors
+        if grad_new_shift_state is None:
+            grad_new_shift_state = torch.zeros_like(shift_state)
+        grad_x, grad_shift_state, grad_x_k, grad_key_weight, grad_value_weight = torch.ops.rwkv7_cmix_bf16_v5.state_backward(
+            grad_out.contiguous(),
+            grad_new_shift_state.contiguous(),
+            x,
+            shift_state,
+            x_k,
+            key_weight,
+            value_weight,
+            mixed,
+            act,
+        )
+        return grad_x, grad_shift_state, grad_x_k, grad_key_weight, grad_value_weight
+
 ########################################################################################################
 
 load(name="rwkv7_tmix_mix6_bf16_v5", sources=["cuda/rwkv7_tmix_mix6_bf16_v5.cpp","cuda/rwkv7_tmix_mix6_bf16_v5.cu"], extra_cflags=["-O3"],
@@ -143,9 +219,54 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
+def _setup_state_context(ctx, inputs, output):
+    del output
+    ctx.save_for_backward(*inputs)
+
+def _state_backward(ctx, grads):
+    x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g = ctx.saved_tensors
+    grad_new_shift = grads[6]
+    if grad_new_shift is None:
+        grad_new_shift = torch.zeros_like(shift_state)
+    return tuple(torch.ops.rwkv7_tmix_mix6_bf16_v5.state_backward(
+        grads[0].contiguous(),
+        grads[1].contiguous(),
+        grads[2].contiguous(),
+        grads[3].contiguous(),
+        grads[4].contiguous(),
+        grads[5].contiguous(),
+        grad_new_shift.contiguous(),
+        x,
+        shift_state,
+        x_r,
+        x_w,
+        x_k,
+        x_v,
+        x_a,
+        x_g,
+    ))
+
+torch.library.register_autograd(
+    "rwkv7_tmix_mix6_bf16_v5::state_forward",
+    _state_backward,
+    setup_context=_setup_state_context,
+)
+
 def _forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g):
     return torch.ops.rwkv7_tmix_mix6_bf16_v5.forward(
         x.contiguous(),
+        x_r.contiguous(),
+        x_w.contiguous(),
+        x_k.contiguous(),
+        x_v.contiguous(),
+        x_a.contiguous(),
+        x_g.contiguous(),
+    )
+
+def _state_forward_op(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g):
+    return torch.ops.rwkv7_tmix_mix6_bf16_v5.state_forward(
+        x.contiguous(),
+        shift_state.contiguous(),
         x_r.contiguous(),
         x_w.contiguous(),
         x_k.contiguous(),
@@ -167,12 +288,30 @@ def _tmix_mix6_bf16_v5_jit(
     outs = torch.ops.rwkv7_tmix_mix6_bf16_v5.forward(x.contiguous(), x_r.contiguous(), x_w.contiguous(), x_k.contiguous(), x_v.contiguous(), x_a.contiguous(), x_g.contiguous())
     return outs[0], outs[1], outs[2], outs[3], outs[4], outs[5]
 
+@torch.jit.script
+def _tmix_mix6_state_bf16_v5_jit(
+    x: torch.Tensor,
+    shift_state: torch.Tensor,
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    outs = torch.ops.rwkv7_tmix_mix6_bf16_v5.state_forward(x.contiguous(), shift_state.contiguous(), x_r.contiguous(), x_w.contiguous(), x_k.contiguous(), x_v.contiguous(), x_a.contiguous(), x_g.contiguous())
+    return outs[0], outs[1], outs[2], outs[3], outs[4], outs[5], outs[6]
+
 if os.environ.get("RWKV_JIT_ON") == "1":
     def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g):
         return _tmix_mix6_bf16_v5_jit(x, x_r, x_w, x_k, x_v, x_a, x_g)
+    def tmix_mix6_state_bf16_v5(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g):
+        return _tmix_mix6_state_bf16_v5_jit(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g)
 else:
     def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g):
         return tuple(_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
+    def tmix_mix6_state_bf16_v5(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g):
+        return tuple(_state_forward_op(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g))
 
 ########################################################################################################
 
@@ -680,6 +819,54 @@ class RWKV_Tmix_x070(MyModule):
 
         return x, v_first
 
+    @MyFunction
+    def forward_infctx(self, x, v_first, shift_state, wkv_state):
+        B, T, C = x.size()
+
+        xr, xw, xk, xv, xa, xg, new_shift_state = tmix_mix6_state_bf16_v5(
+            x,
+            shift_state,
+            self.x_r.view(-1),
+            self.x_w.view(-1),
+            self.x_k.view(-1),
+            self.x_v.view(-1),
+            self.x_a.view(-1),
+            self.x_g.view(-1),
+        )
+
+        r = self.receptance(xr)
+        w = self.w0 + torch.tanh(xw @ self.w1) @ self.w2
+        k = self.key(xk)
+        v = self.value(xv)
+        if self.layer_id == 0:
+            v_first = v
+        else:
+            v12 = (xv @ self.v1) @ self.v2
+            v = tmix_vres_gate_bf16_v1(v, v_first, self.v0, v12)
+
+        a = tmix_a_gate_bf16(self.a0, (xa @ self.a1) @ self.a2)
+        g = torch.sigmoid(xg @ self.g1) @ self.g2
+        k, neg_kk, kka = tmix_kk_pre_bf16_v5(
+            k,
+            self.k_k.view(-1),
+            a,
+            self.k_a.view(-1),
+        )
+        wkv_state = wkv_state.contiguous()
+        x, new_wkv_state = RWKV7_STATEPASSING_CLAMPW_CUDA(wkv_state, r, w, k, v, neg_kk, kka)
+        x = tmix_lnx_rkvres_xg_bf16_v1(
+                x,
+                r,
+                k,
+                v,
+                self.r_k,
+                self.ln_x.weight,
+                self.ln_x.bias,
+                g,
+        )
+        x = self.output(x)
+        return x, v_first, new_shift_state, new_wkv_state
+
 ########################################################################################################
 
 # class RWKV_CMix_x070(MyModule): # slow pytorch version
@@ -733,6 +920,15 @@ class RWKV_CMix_x070(nn.Module): # fast CUDA version
     def forward(self, x):
         return _CmixLayerV2Fn.apply(x, self.x_k.view(-1), self.key.weight, self.value.weight)
 
+    def forward_infctx(self, x, shift_state):
+        return _CmixStateLayerV2Fn.apply(
+            x,
+            shift_state,
+            self.x_k.view(-1),
+            self.key.weight,
+            self.value.weight,
+        )
+
 ########################################################################################################
 # The RWKV Model with our blocks
 ########################################################################################################
@@ -761,6 +957,22 @@ class Block(nn.Module):
 
         x = x + self.ffn(self.ln2(x))
         return x, v_first
+
+    def forward_infctx(self, x, v_first, tmix_shift_state, wkv_state, cmix_shift_state):
+        if self.layer_id == 0:
+            x = self.ln0(x)
+
+        x_attn, v_first, new_tmix_shift_state, new_wkv_state = self.att.forward_infctx(
+            self.ln1(x),
+            v_first,
+            tmix_shift_state,
+            wkv_state,
+        )
+        x = x + x_attn
+
+        x_ffn, new_cmix_shift_state = self.ffn.forward_infctx(self.ln2(x), cmix_shift_state)
+        x = x + x_ffn
+        return x, v_first, new_tmix_shift_state, new_wkv_state, new_cmix_shift_state
 
 
 # class L2Wrap(torch.autograd.Function): # avoid: very slow and takes lots of vram
@@ -855,13 +1067,123 @@ class RWKV(pl.LightningModule):
 
         v_first = torch.empty_like(x)
         for block in self.blocks:
-            if args.grad_cp == 1:
+            if args.grad_cp == 1 and torch.is_grad_enabled():
                 x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
             else:
                 x, v_first = block(x, v_first)
 
         x = self.ln_out(x)
         return x
+
+    def _infctx_chunk_ctx(self, chunk_ctx=None):
+        args = self.args
+        if chunk_ctx is None:
+            chunk_ctx = getattr(args, "chunk_ctx", 0)
+        chunk_ctx = int(chunk_ctx)
+        if chunk_ctx <= 0:
+            raise ValueError("infctx requires chunk_ctx > 0.")
+        if chunk_ctx >= int(args.ctx_len):
+            raise ValueError("infctx requires chunk_ctx < ctx_len.")
+        chunk_len = int(globals().get("CHUNK_LEN", 16))
+        if chunk_ctx % chunk_len != 0:
+            raise ValueError(f"infctx chunk_ctx must be divisible by RWKV CUDA chunk length {chunk_len}.")
+        return chunk_ctx
+
+    def create_infctx_state(self, batch_size, device, dtype):
+        args = self.args
+        head_size = int(args.head_size)
+        n_head = int(args.dim_att) // head_size
+        shift_states = torch.zeros(
+            int(args.n_layer),
+            2,
+            batch_size,
+            int(args.n_embd),
+            device=device,
+            dtype=dtype,
+        )
+        wkv_states = torch.zeros(
+            int(args.n_layer),
+            batch_size,
+            n_head,
+            head_size,
+            head_size,
+            device=device,
+            dtype=torch.float32,
+        )
+        return shift_states, wkv_states
+
+    def forward_infctx_chunk(self, idx, shift_states, wkv_states):
+        args = self.args
+        B, T = idx.size()
+        chunk_len = int(globals().get("CHUNK_LEN", 16))
+        assert T % chunk_len == 0, "infctx chunk length must be padded to RWKV CUDA chunk length."
+        assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
+
+        x = self.emb(idx)
+        v_first = torch.empty_like(x)
+        new_tmix_shift_states = []
+        new_cmix_shift_states = []
+        new_wkv_states = []
+        for layer_id, block in enumerate(self.blocks):
+            if args.grad_cp == 1 and torch.is_grad_enabled():
+                x, v_first, new_tmix_shift_state, new_wkv_state, new_cmix_shift_state = deepspeed.checkpointing.checkpoint(
+                    block.forward_infctx,
+                    x,
+                    v_first,
+                    shift_states[layer_id, 0],
+                    wkv_states[layer_id],
+                    shift_states[layer_id, 1],
+                )
+            else:
+                x, v_first, new_tmix_shift_state, new_wkv_state, new_cmix_shift_state = block.forward_infctx(
+                    x,
+                    v_first,
+                    shift_states[layer_id, 0],
+                    wkv_states[layer_id],
+                    shift_states[layer_id, 1],
+                )
+            new_tmix_shift_states.append(new_tmix_shift_state)
+            new_cmix_shift_states.append(new_cmix_shift_state)
+            new_wkv_states.append(new_wkv_state)
+
+        x = self.ln_out(x)
+        new_shift_states = torch.stack(
+            [
+                torch.stack([tmix_shift_state, cmix_shift_state], dim=0)
+                for tmix_shift_state, cmix_shift_state in zip(new_tmix_shift_states, new_cmix_shift_states)
+            ],
+            dim=0,
+        )
+        return x, new_shift_states, torch.stack(new_wkv_states, dim=0)
+
+    def forward_infctx_features(self, idx, *, chunk_ctx=None, detach_state_between_chunks=False):
+        args = self.args
+        B, T = idx.size()
+        assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
+        chunk_ctx = self._infctx_chunk_ctx(chunk_ctx)
+        chunk_len = int(globals().get("CHUNK_LEN", 16))
+        shift_states, wkv_states = self.create_infctx_state(B, idx.device, self.emb.weight.dtype)
+        chunks = []
+        for start in range(0, T, chunk_ctx):
+            idx_chunk = idx[:, start : start + chunk_ctx]
+            valid_T = idx_chunk.size(1)
+            pad_len = (-valid_T) % chunk_len
+            if pad_len:
+                idx_chunk = F.pad(idx_chunk, (0, pad_len), value=0)
+            hidden, shift_states, wkv_states = self.forward_infctx_chunk(idx_chunk, shift_states, wkv_states)
+            chunks.append(hidden[:, :valid_T])
+            if detach_state_between_chunks:
+                shift_states = shift_states.detach()
+                wkv_states = wkv_states.detach()
+        return torch.cat(chunks, dim=1)
+
+    def forward_infctx_sequence(self, idx, *, chunk_ctx=None, detach_state_between_chunks=False):
+        hidden = self.forward_infctx_features(
+            idx,
+            chunk_ctx=chunk_ctx,
+            detach_state_between_chunks=detach_state_between_chunks,
+        )
+        return self.head(hidden)
 
     if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0: # saves 70~80% VRAM
 
