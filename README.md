@@ -18,13 +18,14 @@ rwkv7_l2wrap_ce_bf16_v2
 
 **Train RWKV-7:**
 ```
+# enter the installable RWKV-7 training project
+cd RWKV-v7/train_temp/
+
 # you can use latest torch + latest cuda (not limited to cu121)
 pip install torch --upgrade --extra-index-url https://download.pytorch.org/whl/cu121
-pip install pytorch-lightning==1.9.5 deepspeed wandb ninja --upgrade
+pip install -e .
 
 # train RWKV-7
-cd RWKV-v7/train_temp/ 
-
 # download minipile .bin .idx to train_temp/data first (download link in demo-training-prepare.sh)
 
 # this will generate the initial weight rwkv-init.pth in out/....../

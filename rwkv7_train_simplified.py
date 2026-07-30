@@ -11,7 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.cpp_extension import load
-from src.cuda_sources import cuda_sources
+from rwkv_lm.cuda_sources import cuda_sources
 def set_seed_all(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)

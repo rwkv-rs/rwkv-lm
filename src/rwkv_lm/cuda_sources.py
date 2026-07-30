@@ -1,6 +1,6 @@
 from pathlib import Path
 
-_CUDA_DIR = Path(__file__).resolve().parent.parent / "cuda"
+_CUDA_DIR = Path(__file__).resolve().parent / "cuda"
 
 
 def cuda_sources(*filenames: str) -> list[str]:

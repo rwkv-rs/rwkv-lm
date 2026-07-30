@@ -125,7 +125,10 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
             return y.view(B,T,HN),sT
     else:
         def RWKV7_STATEPASSING_CLAMPW_CUDA(s0,r,w,k,v,a,b):
-            raise RuntimeError("RWKV infctx requires RWKV_TRAIN_TYPE=infctx before importing src.model.")
+            raise RuntimeError(
+                "RWKV infctx requires RWKV_TRAIN_TYPE=infctx before importing "
+                "rwkv_lm.model."
+            )
 
 	########################################################################################################
 
