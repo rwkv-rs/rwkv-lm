@@ -11,6 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.cpp_extension import load
+from src.cuda_sources import cuda_sources
 def set_seed_all(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -35,7 +36,7 @@ print("This is a simplified RWKV7 training demo (slow & different results)")
 HEAD_SIZE = 16 # !!! use HEAD_SIZE = 64 for LM !!!
 CHUNK_LEN = 16
 flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
-load(name="wind_backstepping", sources=[f'cuda/wkv7_cuda_fp32.cu', 'cuda/wkv7_op_fp32.cpp'], is_python_module=False, verbose=False, extra_cuda_cflags=flags)
+load(name="wind_backstepping", sources=cuda_sources('wkv7_cuda_fp32.cu', 'wkv7_op_fp32.cpp'), is_python_module=False, verbose=False, extra_cuda_cflags=flags)
 class WindBackstepping(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w,q,k,v,z,b):
