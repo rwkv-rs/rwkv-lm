@@ -354,7 +354,7 @@ def main() -> None:
         raise ValueError("--chunk-ctx must be divisible by 16.")
 
     _prepare_import()
-    import src.model as model
+    import rwkv_lm.model as model
 
     torch.manual_seed(123)
     torch.cuda.set_device(0)

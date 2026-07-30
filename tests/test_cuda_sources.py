@@ -1,22 +1,14 @@
 import ast
-import importlib.util
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-CUDA_DIR = ROOT / "cuda"
-CUDA_LOADERS = (
-    ROOT / "src" / "model.py",
-    ROOT / "rwkv7_train_simplified.py",
-)
+from rwkv_lm.cuda_sources import cuda_sources
 
-spec = importlib.util.spec_from_file_location(
-    "rwkv_lm_cuda_sources",
-    ROOT / "src" / "cuda_sources.py",
+PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src" / "rwkv_lm"
+CUDA_DIR = PACKAGE_DIR / "cuda"
+CUDA_LOADERS = (
+    PACKAGE_DIR / "model.py",
+    Path(__file__).resolve().parents[1] / "rwkv7_train_simplified.py",
 )
-assert spec is not None and spec.loader is not None
-cuda_sources_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(cuda_sources_module)
-cuda_sources = cuda_sources_module.cuda_sources
 
 
 def _declared_cuda_sources(source_file: Path) -> list[tuple[str, ...]]:

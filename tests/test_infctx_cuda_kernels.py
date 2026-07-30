@@ -1,7 +1,5 @@
 import importlib
 import os
-import sys
-from pathlib import Path
 
 import pytest
 
@@ -20,9 +18,7 @@ def _import_model():
     os.environ.setdefault("RWKV_JIT_ON", "1")
     os.environ["RWKV_TRAIN_TYPE"] = "infctx"
     os.environ.setdefault("RWKV_CHUNK_CTX", "16")
-    root = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(root))
-    return importlib.import_module("src.model")
+    return importlib.import_module("rwkv_lm.model")
 
 
 def _rand_bf16(*shape, requires_grad=False, scale=1.0):
