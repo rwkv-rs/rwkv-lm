@@ -16,6 +16,10 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
+from rwkv_lm.activation_checkpointing import (
+    FSDP2_ACTIVATION_CHECKPOINT_POLICY,
+    FSDP2ActivationCheckpointing,
+)
 from rwkv_lm.checkpoint import (
     ArtifactRecord,
     CheckpointContractError,
@@ -41,6 +45,75 @@ class _RankDivergentScheduler:
         self.rank = int(state_dict["rank"])
 
 
+class _CountingTransform(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        self.forward_calls += 1
+        return inputs * 0.5
+
+
+class _ActivationBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((4,), 0.75))
+        self.forward_calls = 0
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        self.forward_calls += 1
+        return torch.tanh(inputs * self.scale)
+
+
+class _CountingHead(nn.Linear):
+    def __init__(self) -> None:
+        super().__init__(4, 2, bias=False)
+        self.forward_calls = 0
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        self.forward_calls += 1
+        return super().forward(inputs)
+
+
+class _ActivationCheckpointModel(nn.Module):
+    def __init__(self, *, activation_checkpointing: bool) -> None:
+        super().__init__()
+        self.input = _CountingTransform()
+        self.blocks = nn.ModuleList([_ActivationBlock(), _ActivationBlock()])
+        self.head = _CountingHead()
+        self.activation_checkpointing = (
+            FSDP2ActivationCheckpointing.for_rwkv_blocks(
+                self.blocks,
+                enabled=activation_checkpointing,
+            )
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        hidden = self.activation_checkpointing.run(
+            self.input,
+            self.input,
+            inputs,
+        )
+        for block in self.blocks:
+            hidden = self.activation_checkpointing.run(
+                block,
+                block,
+                hidden,
+            )
+        return self.activation_checkpointing.run(
+            self.head,
+            self.head,
+            hidden,
+        )
+
+    def reset_forward_calls(self) -> None:
+        self.input.forward_calls = 0
+        self.head.forward_calls = 0
+        for block in self.blocks:
+            block.forward_calls = 0
+
+
 def _new_fsdp2_runner() -> tuple[
     nn.Module,
     torch.optim.Optimizer,
@@ -60,6 +133,25 @@ def _new_fsdp2_runner() -> tuple[
         eta_min=1e-4,
     )
     return model, optimizer, scheduler
+
+
+def _new_activation_checkpoint_runner(
+    *,
+    activation_checkpointing: bool = True,
+) -> tuple[
+    _ActivationCheckpointModel,
+    torch.optim.Optimizer,
+]:
+    torch.manual_seed(20260802)
+    model = _ActivationCheckpointModel(
+        activation_checkpointing=activation_checkpointing,
+    )
+    mesh = init_device_mesh("cpu", (dist.get_world_size(),))
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh)
+    fully_shard(model, mesh=mesh)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.02)
+    return model, optimizer
 
 
 def _seed_rank_training_rng(rank: int) -> None:
@@ -97,6 +189,34 @@ def _train_steps(
             gradient_scaler=gradient_scaler,
         )
         scheduler.step()
+        losses.append(float(loss.detach()))
+    return losses
+
+
+def _train_activation_checkpoint_steps(
+    model: _ActivationCheckpointModel,
+    optimizer: torch.optim.Optimizer,
+    *,
+    start_step: int,
+    step_count: int,
+) -> list[float]:
+    losses = []
+    for step in range(start_step, start_step + step_count):
+        inputs = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        inputs = inputs / 8 + step * 0.05
+        targets = torch.tensor(
+            [[0.25, -0.5], [-0.25, 0.5]],
+            dtype=torch.float32,
+        )
+        loss = _run_accumulated_optimizer_step(
+            model,
+            optimizer,
+            ((inputs, targets),),
+            forward_loss=lambda batch, _: (
+                model(batch[0]) - batch[1]
+            ).square().mean(),
+            grad_clip=1.0,
+        )
         losses.append(float(loss.detach()))
     return losses
 
@@ -223,6 +343,189 @@ def _fsdp2_worker(rank: int, root: str) -> None:
         assert overflow_gradient_scaler.get_scale() == (
             initial_scale * overflow_gradient_scaler.get_backoff_factor()
         )
+
+        activation_probe_model, activation_probe_optimizer = (
+            _new_activation_checkpoint_runner()
+        )
+        assert activation_probe_model.activation_checkpointing.enabled
+        assert not activation_probe_model.activation_checkpointing.use_reentrant
+        assert not activation_probe_model.activation_checkpointing.selects(
+            activation_probe_model
+        )
+        assert not activation_probe_model.activation_checkpointing.selects(
+            activation_probe_model.input
+        )
+        assert not activation_probe_model.activation_checkpointing.selects(
+            activation_probe_model.head
+        )
+        assert all(
+            activation_probe_model.activation_checkpointing.selects(block)
+            for block in activation_probe_model.blocks
+        )
+        activation_probe_model.activation_checkpointing.require_rwkv_blocks(
+            activation_probe_model.blocks,
+            enabled=True,
+        )
+        with pytest.raises(
+            CheckpointContractError,
+            match="select exactly RWKV blocks",
+        ):
+            activation_probe_model.activation_checkpointing.require_rwkv_blocks(
+                (
+                    activation_probe_model.input,
+                    *activation_probe_model.blocks,
+                ),
+                enabled=True,
+            )
+        activation_probe_model.reset_forward_calls()
+        activation_probe_losses = _train_activation_checkpoint_steps(
+            activation_probe_model,
+            activation_probe_optimizer,
+            start_step=0,
+            step_count=1,
+        )
+        assert activation_probe_model.input.forward_calls == 1
+        assert activation_probe_model.head.forward_calls == 1
+        assert all(
+            block.forward_calls == 2
+            for block in activation_probe_model.blocks
+        )
+        assert all(
+            block.scale.grad is not None
+            and torch.count_nonzero(block.scale.grad) > 0
+            for block in activation_probe_model.blocks
+        )
+
+        activation_reference_model, activation_reference_optimizer = (
+            _new_activation_checkpoint_runner(
+                activation_checkpointing=False,
+            )
+        )
+        activation_reference_model.reset_forward_calls()
+        activation_reference_losses = _train_activation_checkpoint_steps(
+            activation_reference_model,
+            activation_reference_optimizer,
+            start_step=0,
+            step_count=1,
+        )
+        assert all(
+            block.forward_calls == 1
+            for block in activation_reference_model.blocks
+        )
+        torch.testing.assert_close(
+            torch.tensor(activation_probe_losses),
+            torch.tensor(activation_reference_losses),
+            rtol=0,
+            atol=0,
+        )
+        _assert_nested_equal(
+            _snapshot(activation_probe_model.state_dict()),
+            _snapshot(activation_reference_model.state_dict()),
+        )
+
+        (
+            uninterrupted_activation_model,
+            uninterrupted_activation_optimizer,
+        ) = _new_activation_checkpoint_runner()
+        uninterrupted_activation_losses = _train_activation_checkpoint_steps(
+            uninterrupted_activation_model,
+            uninterrupted_activation_optimizer,
+            start_step=0,
+            step_count=4,
+        )
+        uninterrupted_activation_model_state = _snapshot(
+            uninterrupted_activation_model.state_dict()
+        )
+        uninterrupted_activation_optimizer_state = _snapshot(
+            uninterrupted_activation_optimizer.state_dict()
+        )
+
+        interrupted_activation_model, interrupted_activation_optimizer = (
+            _new_activation_checkpoint_runner()
+        )
+        _train_activation_checkpoint_steps(
+            interrupted_activation_model,
+            interrupted_activation_optimizer,
+            start_step=0,
+            step_count=2,
+        )
+        activation_adapter = FSDP2CheckpointRunnerAdapter.from_process_group(
+            training_config={
+                "accumulate_grad_batches": 1,
+                "batch_size": 4,
+                "epoch_steps": 2,
+                "fsdp2_activation_checkpointing": (
+                    FSDP2_ACTIVATION_CHECKPOINT_POLICY
+                ),
+                "grad_cp": 1,
+                "model": "tiny-activation-checkpoint-fsdp2",
+                "precision": 32,
+                "seed": 20260802,
+            },
+            samples_per_epoch=8,
+        )
+        activation_checkpoint = (
+            root_path / "checkpoints" / "activation-epoch-00000001"
+        )
+        activation_manifest = activation_adapter.save(
+            activation_checkpoint,
+            model=interrupted_activation_model,
+            optimizer=interrupted_activation_optimizer,
+            global_step=2,
+            next_epoch=1,
+        )
+
+        resumed_activation_model, resumed_activation_optimizer = (
+            _new_activation_checkpoint_runner()
+        )
+        activation_progress = activation_adapter.restore(
+            activation_checkpoint,
+            model=resumed_activation_model,
+            optimizer=resumed_activation_optimizer,
+        )
+        resumed_activation_losses = _train_activation_checkpoint_steps(
+            resumed_activation_model,
+            resumed_activation_optimizer,
+            start_step=2,
+            step_count=2,
+        )
+        assert activation_progress.global_step == 2
+        assert activation_progress.epoch == 1
+        torch.testing.assert_close(
+            torch.tensor(resumed_activation_losses),
+            torch.tensor(uninterrupted_activation_losses[2:]),
+            rtol=0,
+            atol=0,
+        )
+        _assert_nested_equal(
+            _snapshot(resumed_activation_model.state_dict()),
+            uninterrupted_activation_model_state,
+        )
+        _assert_nested_equal(
+            _snapshot(resumed_activation_optimizer.state_dict()),
+            uninterrupted_activation_optimizer_state,
+        )
+        assert (
+            activation_manifest.states["gradient_scaler"].serialization
+            == "torch-grad-scaler-json-v1"
+        )
+
+        drifted_activation_config = dict(activation_adapter.training_config)
+        drifted_activation_config["fsdp2_activation_checkpointing"] = "disabled"
+        drifted_activation_adapter = FSDP2CheckpointRunnerAdapter(
+            backend=activation_adapter.backend,
+            training_config=drifted_activation_config,
+            samples_per_epoch=activation_adapter.samples_per_epoch,
+        )
+        with pytest.raises(
+            CheckpointContractError,
+            match="training config",
+        ):
+            drifted_activation_adapter.restore(
+                activation_checkpoint,
+                model=resumed_activation_model,
+                optimizer=resumed_activation_optimizer,
+            )
 
         uninterrupted_model, uninterrupted_optimizer, uninterrupted_scheduler = (
             _new_fsdp2_runner()

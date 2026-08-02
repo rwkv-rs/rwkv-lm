@@ -15,6 +15,10 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.utils.data import DataLoader
 
+from .activation_checkpointing import (
+    FSDP2_ACTIVATION_CHECKPOINT_POLICY,
+    FSDP2ActivationCheckpointing,
+)
 from .checkpoint import CheckpointContractError
 from .checkpoint_fsdp2 import FSDP2CheckpointRunnerAdapter
 from .trainer import _checkpoint_training_config, scheduled_learning_rate
@@ -74,6 +78,19 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
     model.to(device)
     if isinstance(model, FSDPModule):
         raise CheckpointContractError("RWKV model was already wrapped by fully_shard")
+    activation_checkpointing = getattr(
+        model,
+        "_fsdp2_activation_checkpointing",
+        None,
+    )
+    if not isinstance(activation_checkpointing, FSDP2ActivationCheckpointing):
+        raise CheckpointContractError(
+            "RWKV model is missing its FSDP2 activation checkpoint policy"
+        )
+    activation_checkpointing.require_rwkv_blocks(
+        model.blocks,
+        enabled=args.grad_cp == 1,
+    )
     for block in model.blocks:
         fully_shard(block, mesh=mesh, mp_policy=mixed_precision)
     fully_shard(model, mesh=mesh, mp_policy=mixed_precision)
@@ -91,6 +108,11 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
     checkpoint_config.update(
         {
             "distributed_backend": dist.get_backend(),
+            "fsdp2_activation_checkpointing": (
+                FSDP2_ACTIVATION_CHECKPOINT_POLICY
+                if args.grad_cp == 1
+                else "disabled"
+            ),
             "fsdp2_wrap_policy": _FSDP2_WRAP_POLICY,
             "optimizer_backend": f"{optimizer_type.__module__}.{optimizer_type.__name__}",
         }

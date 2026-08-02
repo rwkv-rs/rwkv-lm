@@ -5,7 +5,6 @@
 import os, sys, math, gc, importlib
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
@@ -13,6 +12,7 @@ if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 
+from .activation_checkpointing import FSDP2ActivationCheckpointing
 from .infctx import (
     InfctxBoundary,
     InfctxContractError,
@@ -1112,6 +1112,12 @@ class RWKV(pl.LightningModule):
         self.blocks = nn.ModuleList(
             [Block(args, i, self.lora_config) for i in range(args.n_layer)]
         )
+        self._fsdp2_activation_checkpointing = (
+            FSDP2ActivationCheckpointing.for_rwkv_blocks(
+                self.blocks,
+                enabled=args.grad_cp == 1,
+            )
+        )
 
         self.ln_out = nn.LayerNorm(args.n_embd)
         self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
@@ -1219,11 +1225,11 @@ class RWKV(pl.LightningModule):
         for block in self.blocks:
             if args.grad_cp == 1 and torch.is_grad_enabled():
                 if str(args.strategy).lower() == "fsdp2":
-                    x, v_first = torch_checkpoint(
+                    x, v_first = self._fsdp2_activation_checkpointing.run(
+                        block,
                         block,
                         x,
                         v_first,
-                        use_reentrant=False,
                     )
                 else:
                     x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
@@ -1355,7 +1361,10 @@ class RWKV(pl.LightningModule):
                         new_tmix_shift_state,
                         new_wkv_state,
                         new_cmix_shift_state,
-                    ) = torch_checkpoint(*checkpoint_args, use_reentrant=False)
+                    ) = self._fsdp2_activation_checkpointing.run(
+                        block,
+                        *checkpoint_args,
+                    )
                 else:
                     (
                         x,
