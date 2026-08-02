@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import pickle
@@ -24,12 +26,29 @@ LORA_TARGET_MODULES = (
     "channel_mix.value",
 )
 _ADAPTER_FORMAT = "rwkv-lora-adapter"
-_ADAPTER_SCHEMA_VERSION = 1
+_ADAPTER_SCHEMA_VERSION = 2
+_BASE_IDENTITY_FORMAT = "rwkv-lora-base-identity"
+_BASE_IDENTITY_SCHEMA_VERSION = 1
+_BASE_PROVENANCE_ATTRIBUTE = "_rwkv_lora_base_provenance"
 _CHECKPOINT_WRAPPER_SEGMENT = "._checkpoint_wrapped_module"
 
 
 class PeftContractError(ValueError):
     """Raised when a PEFT request would be ambiguous or incomplete."""
+
+
+@dataclass(frozen=True)
+class _LoraBaseProvenance:
+    model_type: str
+    model_config_json: str
+    source_revision: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "model_type": self.model_type,
+            "model_config": json.loads(self.model_config_json),
+            "source_revision": self.source_revision,
+        }
 
 
 @dataclass(frozen=True)
@@ -103,6 +122,36 @@ class LoraConfig:
             "dropout": self.dropout,
             "target_modules": list(self.target_modules),
         }
+
+
+def bind_lora_base_provenance(
+    model: nn.Module,
+    *,
+    model_config: Mapping[str, object],
+    source_revision: str,
+    model_type: str | None = None,
+) -> None:
+    """Bind stable model metadata required by adapter-only artifacts."""
+
+    if not isinstance(model, nn.Module):
+        raise PeftContractError("LoRA base provenance requires a Torch module")
+    if model_type is None:
+        model_type = f"{type(model).__module__}.{type(model).__qualname__}"
+    if not isinstance(model_type, str) or not model_type.strip():
+        raise PeftContractError("LoRA base model type must be a non-empty string")
+    provenance = _LoraBaseProvenance(
+        model_type=model_type.strip(),
+        model_config_json=_canonical_model_config_json(model_config),
+        source_revision=_lower_hex(
+            source_revision,
+            length=40,
+            owner="LoRA base source revision",
+        ),
+    )
+    existing = getattr(model, _BASE_PROVENANCE_ATTRIBUTE, None)
+    if existing is not None and existing != provenance:
+        raise PeftContractError("LoRA base provenance is already bound differently")
+    setattr(model, _BASE_PROVENANCE_ATTRIBUTE, provenance)
 
 
 class LoraDelta(nn.Module):
@@ -336,6 +385,7 @@ def save_lora_adapter(model: nn.Module, path: Path) -> Path:
     payload = {
         "format": _ADAPTER_FORMAT,
         "schema_version": _ADAPTER_SCHEMA_VERSION,
+        "base_identity": _lora_base_identity(model),
         "config": config.to_dict(),
         "state_dict": lora_adapter_state_dict(model),
     }
@@ -407,13 +457,21 @@ def load_lora_adapter(model: nn.Module, path: Path) -> LoraConfig:
         raise PeftContractError(f"LoRA adapter is unreadable: {source}") from error
     payload = _exact_mapping(
         raw,
-        {"format", "schema_version", "config", "state_dict"},
+        {"format", "schema_version", "base_identity", "config", "state_dict"},
         "LoRA adapter",
     )
     if payload["format"] != _ADAPTER_FORMAT:
         raise PeftContractError("LoRA adapter format is unsupported")
-    if payload["schema_version"] != _ADAPTER_SCHEMA_VERSION:
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != _ADAPTER_SCHEMA_VERSION
+    ):
         raise PeftContractError("LoRA adapter schema version is unsupported")
+    artifact_identity = _parse_lora_base_identity(payload["base_identity"])
+    if artifact_identity != _lora_base_identity(model):
+        raise PeftContractError(
+            "LoRA adapter base identity does not match the loaded model"
+        )
     artifact_config = LoraConfig.from_dict(payload["config"])
     if artifact_config != config:
         raise PeftContractError(
@@ -440,21 +498,163 @@ def load_lora_adapter(model: nn.Module, path: Path) -> LoraConfig:
             + (" (" + "; ".join(details) + ")" if details else "")
         )
     parameters = _canonical_parameter_map(model)
-    with torch.no_grad():
-        for name in sorted(expected_names):
-            source_tensor = state[name]
-            destination_tensor = parameters[name]
-            if source_tensor.shape != destination_tensor.shape:
-                raise PeftContractError(
-                    f"LoRA adapter tensor shape does not match: {name}"
-                )
-            if source_tensor.dtype != destination_tensor.dtype:
-                raise PeftContractError(
-                    f"LoRA adapter tensor dtype does not match: {name}"
-                )
-            destination_tensor.copy_(source_tensor.to(destination_tensor.device))
     validate_lora_trainable_parameters(model, config)
+    ordered_names = sorted(expected_names)
+    for name in ordered_names:
+        source_tensor = state[name]
+        destination_tensor = parameters[name]
+        if source_tensor.shape != destination_tensor.shape:
+            raise PeftContractError(f"LoRA adapter tensor shape does not match: {name}")
+        if source_tensor.dtype != destination_tensor.dtype:
+            raise PeftContractError(f"LoRA adapter tensor dtype does not match: {name}")
+    prepared = {}
+    originals = {}
+    try:
+        for name in ordered_names:
+            destination_tensor = parameters[name]
+            prepared[name] = (
+                state[name].detach().to(destination_tensor.device).contiguous().clone()
+            )
+            originals[name] = destination_tensor.detach().clone()
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise PeftContractError("LoRA adapter tensors cannot be prepared") from error
+    try:
+        with torch.no_grad():
+            for name in ordered_names:
+                parameters[name].copy_(prepared[name])
+    except Exception as error:
+        with torch.no_grad():
+            for name in ordered_names:
+                parameters[name].copy_(originals[name])
+        raise PeftContractError("LoRA adapter tensor commit failed") from error
     return artifact_config
+
+
+def _lora_base_identity(model: nn.Module) -> dict[str, object]:
+    provenance = getattr(model, _BASE_PROVENANCE_ATTRIBUTE, None)
+    if not isinstance(provenance, _LoraBaseProvenance):
+        raise PeftContractError(
+            "LoRA adapter requires bound base model config and source revision"
+        )
+    return {
+        "format": _BASE_IDENTITY_FORMAT,
+        "schema_version": _BASE_IDENTITY_SCHEMA_VERSION,
+        **provenance.to_dict(),
+        "state_sha256": _lora_base_state_sha256(model),
+    }
+
+
+def _parse_lora_base_identity(raw: object) -> dict[str, object]:
+    value = _exact_mapping(
+        raw,
+        {
+            "format",
+            "schema_version",
+            "model_type",
+            "model_config",
+            "source_revision",
+            "state_sha256",
+        },
+        "LoRA adapter base identity",
+    )
+    if value["format"] != _BASE_IDENTITY_FORMAT:
+        raise PeftContractError("LoRA adapter base identity format is unsupported")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != _BASE_IDENTITY_SCHEMA_VERSION
+    ):
+        raise PeftContractError(
+            "LoRA adapter base identity schema version is unsupported"
+        )
+    model_type = value["model_type"]
+    if not isinstance(model_type, str) or not model_type.strip():
+        raise PeftContractError(
+            "LoRA adapter base identity model type must be a non-empty string"
+        )
+    return {
+        "format": _BASE_IDENTITY_FORMAT,
+        "schema_version": _BASE_IDENTITY_SCHEMA_VERSION,
+        "model_type": model_type.strip(),
+        "model_config": json.loads(_canonical_model_config_json(value["model_config"])),
+        "source_revision": _lower_hex(
+            value["source_revision"],
+            length=40,
+            owner="LoRA adapter base source revision",
+        ),
+        "state_sha256": _lower_hex(
+            value["state_sha256"],
+            length=64,
+            owner="LoRA adapter base state digest",
+        ),
+    }
+
+
+def _lora_base_state_sha256(model: nn.Module) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"rwkv-lora-base-state-v1\0")
+    for name, tensor in sorted(lora_base_state_dict(model).items()):
+        if not isinstance(tensor, torch.Tensor):
+            raise PeftContractError(f"LoRA base state value must be a tensor: {name}")
+        if tensor.layout != torch.strided or tensor.is_quantized:
+            raise PeftContractError(
+                f"LoRA base state tensor layout is unsupported: {name}"
+            )
+        try:
+            canonical = tensor.detach().cpu().contiguous()
+            tensor_bytes = canonical.view(torch.uint8).numpy().tobytes(order="C")
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise PeftContractError(
+                f"LoRA base state tensor cannot be canonicalized: {name}"
+            ) from error
+        _update_digest_field(digest, name.encode("utf-8"))
+        _update_digest_field(digest, str(canonical.dtype).encode("ascii"))
+        _update_digest_field(
+            digest,
+            json.dumps(list(canonical.shape), separators=(",", ":")).encode("ascii"),
+        )
+        _update_digest_field(digest, tensor_bytes)
+    return digest.hexdigest()
+
+
+def _update_digest_field(digest, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _canonical_model_config_json(raw: object) -> str:
+    if not isinstance(raw, Mapping) or any(not isinstance(key, str) for key in raw):
+        raise PeftContractError(
+            "LoRA base model config must be a mapping with string keys"
+        )
+    try:
+        payload = json.dumps(
+            dict(raw),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise PeftContractError(
+            "LoRA base model config must contain canonical JSON values"
+        ) from error
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise PeftContractError("LoRA base model config must decode to an object")
+    return payload
+
+
+def _lower_hex(raw: object, *, length: int, owner: str) -> str:
+    if (
+        not isinstance(raw, str)
+        or len(raw) != length
+        or raw != raw.lower()
+        or any(character not in "0123456789abcdef" for character in raw)
+    ):
+        raise PeftContractError(
+            f"{owner} must be a lowercase {length}-character hexadecimal string"
+        )
+    return raw
 
 
 def _target_values(raw: object) -> tuple[str, ...]:
@@ -557,6 +757,7 @@ __all__ = [
     "LoraConfig",
     "LoraDelta",
     "PeftContractError",
+    "bind_lora_base_provenance",
     "build_lora_delta",
     "freeze_base_for_lora",
     "load_lora_adapter",

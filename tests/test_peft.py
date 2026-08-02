@@ -12,6 +12,7 @@ from rwkv_lm.checkpoint_runner import EpochCheckpointRunnerAdapter
 from rwkv_lm.peft import (
     LoraConfig,
     PeftContractError,
+    bind_lora_base_provenance,
     build_lora_delta,
     freeze_base_for_lora,
     load_lora_adapter,
@@ -23,11 +24,23 @@ from rwkv_lm.peft import (
     save_lora_merged_model,
 )
 
+_TINY_SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+_TINY_MODEL_CONFIG = {
+    "hidden_size": 4,
+    "model_type": "tiny-rwkv-lora",
+    "output_size": 3,
+}
+
 
 class _TinyLoraModel(nn.Module):
     """Small real linear owner using the same adapter and artifact contract."""
 
-    def __init__(self, config: LoraConfig) -> None:
+    def __init__(
+        self,
+        config: LoraConfig,
+        *,
+        source_revision: str = _TINY_SOURCE_REVISION,
+    ) -> None:
         super().__init__()
         self.lora_config = config
         self.projection = nn.Linear(4, 3, bias=False)
@@ -36,6 +49,11 @@ class _TinyLoraModel(nn.Module):
             "time_mix.key",
             in_features=4,
             out_features=3,
+        )
+        bind_lora_base_provenance(
+            self,
+            model_config=_TINY_MODEL_CONFIG,
+            source_revision=source_revision,
         )
         freeze_base_for_lora(self, config)
 
@@ -167,6 +185,11 @@ def test_lora_freezes_base_and_adapter_artifact_fresh_reload_matches_logits(
     model.eval()
     expected_logits = model(inputs).detach()
     artifact = save_lora_adapter(model, tmp_path / "adapter.pt")
+    payload = torch.load(artifact, map_location="cpu", weights_only=True)
+    assert payload["schema_version"] == 2
+    assert payload["base_identity"]["model_config"] == _TINY_MODEL_CONFIG
+    assert payload["base_identity"]["source_revision"] == _TINY_SOURCE_REVISION
+    assert len(payload["base_identity"]["state_sha256"]) == 64
 
     torch.manual_seed(7)
     reloaded = _TinyLoraModel(_config())
@@ -174,6 +197,58 @@ def test_lora_freezes_base_and_adapter_artifact_fresh_reload_matches_logits(
     load_lora_adapter(reloaded, artifact)
     reloaded.eval()
     torch.testing.assert_close(reloaded(inputs), expected_logits, rtol=0, atol=0)
+
+
+def test_adapter_rejects_wrong_base_state_or_source_revision(tmp_path: Path) -> None:
+    torch.manual_seed(20260801)
+    model = _TinyLoraModel(_config())
+    base_state = {
+        name: tensor.detach().clone()
+        for name, tensor in lora_base_state_dict(model).items()
+    }
+    artifact = save_lora_adapter(model, tmp_path / "adapter.pt")
+
+    torch.manual_seed(7)
+    wrong_base = _TinyLoraModel(_config())
+    with pytest.raises(PeftContractError, match="base identity"):
+        load_lora_adapter(wrong_base, artifact)
+
+    wrong_revision = _TinyLoraModel(_config(), source_revision="1" * 40)
+    load_lora_base_state_dict(wrong_revision, base_state)
+    with pytest.raises(PeftContractError, match="base identity"):
+        load_lora_adapter(wrong_revision, artifact)
+
+
+def test_adapter_validation_failure_does_not_modify_any_parameter(
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(20260801)
+    model = _TinyLoraModel(_config())
+    base_state = {
+        name: tensor.detach().clone()
+        for name, tensor in lora_base_state_dict(model).items()
+    }
+    artifact = save_lora_adapter(model, tmp_path / "adapter.pt")
+    payload = torch.load(artifact, map_location="cpu", weights_only=True)
+    payload["state_dict"]["projection_lora.lora_B"] = payload["state_dict"][
+        "projection_lora.lora_B"
+    ].double()
+    invalid_artifact = tmp_path / "invalid-adapter.pt"
+    torch.save(payload, invalid_artifact)
+
+    torch.manual_seed(7)
+    destination = _TinyLoraModel(_config())
+    load_lora_base_state_dict(destination, base_state)
+    before = _clone_state(destination.state_dict())
+    assert not torch.equal(
+        before["projection_lora.lora_A"],
+        payload["state_dict"]["projection_lora.lora_A"],
+    )
+
+    with pytest.raises(PeftContractError, match="dtype"):
+        load_lora_adapter(destination, invalid_artifact)
+
+    _assert_nested_equal(destination.state_dict(), before)
 
 
 def test_standard_checkpoint_restores_adapter_and_optimizer_state(

@@ -39,6 +39,7 @@ from .infctx import (
 from .peft import (
     LoraConfig,
     PeftContractError,
+    bind_lora_base_provenance,
     build_lora_delta,
     freeze_base_for_lora,
     load_lora_adapter,
@@ -62,6 +63,21 @@ _STANDARD_LORA_TARGETS = {
     "channel_mix.key": ("ffn", "key"),
     "channel_mix.value": ("ffn", "value"),
 }
+_STANDARD_LORA_BASE_CONFIG_FIELDS = (
+    "bos_token_id",
+    "context_length",
+    "eos_token_id",
+    "head_size",
+    "hidden_size",
+    "intermediate_size",
+    "model_type",
+    "num_attention_heads",
+    "num_hidden_layers",
+    "use_cache",
+    "vocab_size",
+    "wkv_backend",
+    "wkv_state_dtype",
+)
 
 
 class StandardModelContractError(CheckpointContractError):
@@ -260,6 +276,14 @@ def configure_standard_rwkv7_peft(
         raise PeftContractError("standard RWKV-7 PEFT requires LoraConfig")
     if hasattr(model, "_standard_rwkv7_lora_hook_handles"):
         raise PeftContractError("standard RWKV-7 model already has PEFT configured")
+    bind_lora_base_provenance(
+        model,
+        model_config={
+            name: getattr(model.config, name)
+            for name in _STANDARD_LORA_BASE_CONFIG_FIELDS
+        },
+        source_revision=_STANDARD_RUNTIME_REVISIONS["transformers"],
+    )
     model.lora_config = config
     handles = []
     if config.enabled:
