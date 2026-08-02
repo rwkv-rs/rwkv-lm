@@ -448,6 +448,53 @@ def test_torch_cosine_scheduler_resume_matches_uninterrupted_training(
     )
 
 
+def test_fp16_gradient_scaler_state_round_trips(tmp_path: Path) -> None:
+    base_adapter = _pytorch_adapter()
+    training_config = dict(base_adapter.training_config)
+    training_config["precision"] = 16
+    adapter = EpochCheckpointRunnerAdapter(
+        backend=base_adapter.backend,
+        training_config=training_config,
+        samples_per_epoch=base_adapter.samples_per_epoch,
+    )
+    model, optimizer = _new_runner()
+    gradient_scaler = torch.amp.GradScaler(
+        "cpu",
+        init_scale=128.0,
+        growth_interval=2,
+    )
+    inputs = torch.randn(4, 3)
+    optimizer.zero_grad(set_to_none=True)
+    gradient_scaler.scale(model(inputs).square().mean()).backward()
+    gradient_scaler.step(optimizer)
+    gradient_scaler.update()
+    expected_scaler_state = dict(gradient_scaler.state_dict())
+
+    checkpoint = tmp_path / "epoch-00000001"
+    manifest = adapter.save(
+        checkpoint,
+        model=model,
+        optimizer=optimizer,
+        gradient_scaler=gradient_scaler,
+        global_step=3,
+        next_epoch=1,
+    )
+    resumed_model, resumed_optimizer = _new_runner()
+    resumed_gradient_scaler = torch.amp.GradScaler("cpu")
+    adapter.restore(
+        checkpoint,
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        gradient_scaler=resumed_gradient_scaler,
+    )
+
+    assert (
+        manifest.states["gradient_scaler"].serialization
+        == "torch-grad-scaler-json-v1"
+    )
+    assert resumed_gradient_scaler.state_dict() == expected_scaler_state
+
+
 def test_restore_rejects_backend_or_config_drift_before_model_mutation(
     tmp_path: Path,
 ) -> None:

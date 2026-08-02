@@ -136,6 +136,18 @@ def scheduled_learning_rate(args, global_step):
     return lr, reached_token_limit
 
 
+def _trainer_gradient_scaler(trainer, precision):
+    precision_plugin = getattr(trainer, "precision_plugin", None)
+    if precision_plugin is None:
+        precision_plugin = getattr(trainer.strategy, "precision_plugin", None)
+    gradient_scaler = getattr(precision_plugin, "scaler", None)
+    if precision == 16 and gradient_scaler is None:
+        raise CheckpointContractError(
+            "FP16 standard checkpoint requires the Trainer gradient scaler"
+        )
+    return gradient_scaler
+
+
 class train_callback(pl.Callback):
     def __init__(self, args, *, resume_checkpoint=None):
         super().__init__()
@@ -167,6 +179,10 @@ class train_callback(pl.Callback):
             self.resume_checkpoint,
             model=pl_module,
             optimizer=trainer.optimizers[0],
+            gradient_scaler=_trainer_gradient_scaler(
+                trainer,
+                args.precision,
+            ),
         )
         expected_global_step = int(progress.epoch) * int(args.epoch_steps)
         if (
@@ -206,6 +222,10 @@ class train_callback(pl.Callback):
             checkpoint_dir,
             model=pl_module,
             optimizer=trainer.optimizers[0],
+            gradient_scaler=_trainer_gradient_scaler(
+                trainer,
+                args.precision,
+            ),
             global_step=global_step,
             next_epoch=next_epoch,
         )

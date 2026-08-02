@@ -24,6 +24,7 @@ REQUIRED_STATE_COMPONENTS = (
     "model",
     "optimizer",
     "scheduler",
+    "gradient_scaler",
     "rng",
     "data_cursor",
 )
@@ -33,6 +34,7 @@ SUPPORTED_STATE_SERIALIZATIONS = MappingProxyType(
         "model": "torch-state-dict",
         "optimizer": "torch-optimizer-state",
         "scheduler": "rwkv-callback-schedule-v1",
+        "gradient_scaler": "torch-grad-scaler-json-v1",
         "rng": "torch-rng-state",
         "data_cursor": "rwkv-binidx-epoch-cursor-v1",
     }
@@ -55,6 +57,11 @@ SUPPORTED_SCHEDULER_SERIALIZATIONS = frozenset(
         "torch-lr-scheduler-json-v1",
     }
 )
+SUPPORTED_GRADIENT_SCALER_SERIALIZATIONS = frozenset(
+    {
+        "torch-grad-scaler-json-v1",
+    }
+)
 SUPPORTED_RNG_SERIALIZATIONS = frozenset(
     {
         "torch-rng-state",
@@ -72,6 +79,7 @@ _SUPPORTED_STATE_SERIALIZATION_SETS = MappingProxyType(
         "model": SUPPORTED_MODEL_SERIALIZATIONS,
         "optimizer": SUPPORTED_OPTIMIZER_SERIALIZATIONS,
         "scheduler": SUPPORTED_SCHEDULER_SERIALIZATIONS,
+        "gradient_scaler": SUPPORTED_GRADIENT_SCALER_SERIALIZATIONS,
         "rng": SUPPORTED_RNG_SERIALIZATIONS,
         "data_cursor": SUPPORTED_DATA_CURSOR_SERIALIZATIONS,
     }
@@ -447,7 +455,7 @@ class CheckpointManifest:
                 raise CheckpointContractError(
                     f"checkpoint artifact digest does not match manifest: {record.path}"
                 )
-        _read_canonical_json_object(
+        training_config = _read_canonical_json_object(
             _artifact_path(root, self.training_config.path),
             "training config",
         )
@@ -479,6 +487,17 @@ class CheckpointManifest:
             ):
                 raise CheckpointContractError(
                     "torch scheduler state_dict must be a JSON object"
+                )
+        gradient_scaler = _read_canonical_json_object(
+            _artifact_path(root, self.states["gradient_scaler"].path),
+            "gradient scaler state",
+        )
+        _validate_gradient_scaler_artifact(gradient_scaler)
+        if "precision" in training_config:
+            requires_gradient_scaler = training_config["precision"] == 16
+            if gradient_scaler["enabled"] != requires_gradient_scaler:
+                raise CheckpointContractError(
+                    "gradient scaler enabled state must match training precision"
                 )
         data_cursor = _read_canonical_json_object(
             _artifact_path(root, self.states["data_cursor"].path),
@@ -951,12 +970,66 @@ def _read_canonical_json_object(path: Path, owner: str) -> Mapping[str, object]:
     return value
 
 
+def _validate_gradient_scaler_artifact(
+    payload: Mapping[str, object],
+) -> None:
+    if set(payload) != {"enabled", "state_dict"}:
+        raise CheckpointContractError("gradient scaler state has invalid fields")
+    enabled = payload["enabled"]
+    state_dict = payload["state_dict"]
+    if not isinstance(enabled, bool) or not isinstance(state_dict, dict):
+        raise CheckpointContractError("gradient scaler state has invalid values")
+    if not enabled:
+        if state_dict:
+            raise CheckpointContractError(
+                "disabled gradient scaler state_dict must be empty"
+            )
+        return
+    expected_fields = {
+        "scale",
+        "growth_factor",
+        "backoff_factor",
+        "growth_interval",
+        "_growth_tracker",
+    }
+    if set(state_dict) != expected_fields:
+        raise CheckpointContractError(
+            "enabled gradient scaler state_dict has invalid fields"
+        )
+    scale = state_dict["scale"]
+    growth_factor = state_dict["growth_factor"]
+    backoff_factor = state_dict["backoff_factor"]
+    growth_interval = state_dict["growth_interval"]
+    growth_tracker = state_dict["_growth_tracker"]
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not scale > 0
+        or isinstance(growth_factor, bool)
+        or not isinstance(growth_factor, (int, float))
+        or not growth_factor > 1
+        or isinstance(backoff_factor, bool)
+        or not isinstance(backoff_factor, (int, float))
+        or not 0 < backoff_factor < 1
+        or isinstance(growth_interval, bool)
+        or not isinstance(growth_interval, int)
+        or growth_interval <= 0
+        or isinstance(growth_tracker, bool)
+        or not isinstance(growth_tracker, int)
+        or growth_tracker < 0
+    ):
+        raise CheckpointContractError(
+            "enabled gradient scaler state_dict has invalid values"
+        )
+
+
 __all__ = [
     "CHECKPOINT_FORMAT",
     "CHECKPOINT_MANIFEST_FILENAME",
     "CHECKPOINT_SCHEMA_VERSION",
     "REQUIRED_STATE_COMPONENTS",
     "SUPPORTED_DATA_CURSOR_SERIALIZATIONS",
+    "SUPPORTED_GRADIENT_SCALER_SERIALIZATIONS",
     "SUPPORTED_MODEL_SERIALIZATIONS",
     "SUPPORTED_OPTIMIZER_SERIALIZATIONS",
     "SUPPORTED_RNG_SERIALIZATIONS",

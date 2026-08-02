@@ -25,6 +25,7 @@ from rwkv_lm.checkpoint import (
 from rwkv_lm.checkpoint_fsdp2 import FSDP2CheckpointRunnerAdapter
 from rwkv_lm.fsdp2_trainer import (
     _accumulation_windows,
+    _gradient_scaler,
     _run_accumulated_optimizer_step,
 )
 
@@ -74,6 +75,7 @@ def _train_steps(
     *,
     step_count: int,
     accumulation_steps: int,
+    gradient_scaler: torch.amp.GradScaler | None = None,
 ) -> list[float]:
     losses = []
     for _ in range(step_count):
@@ -92,6 +94,7 @@ def _train_steps(
             .square()
             .mean(),
             grad_clip=1.0,
+            gradient_scaler=gradient_scaler,
         )
         scheduler.step()
         losses.append(float(loss.detach()))
@@ -197,9 +200,35 @@ def _fsdp2_worker(rank: int, root: str) -> None:
         )
         _assert_model_state_close(accumulated_model, reference_model)
 
+        overflow_model, overflow_optimizer, _ = _new_fsdp2_runner()
+        overflow_gradient_scaler = _gradient_scaler(16, device="cpu")
+        assert overflow_gradient_scaler is not None
+        overflow_model_state = _snapshot(overflow_model.state_dict())
+        initial_scale = overflow_gradient_scaler.get_scale()
+        overflow_factor = float("inf") if rank == 0 else 1.0
+        _run_accumulated_optimizer_step(
+            overflow_model,
+            overflow_optimizer,
+            ((torch.ones(2, 4),),),
+            forward_loss=lambda batch, _: (
+                overflow_model(batch[0]).square().mean() * overflow_factor
+            ),
+            grad_clip=1.0,
+            gradient_scaler=overflow_gradient_scaler,
+        )
+        _assert_nested_equal(
+            _snapshot(overflow_model.state_dict()),
+            overflow_model_state,
+        )
+        assert overflow_gradient_scaler.get_scale() == (
+            initial_scale * overflow_gradient_scaler.get_backoff_factor()
+        )
+
         uninterrupted_model, uninterrupted_optimizer, uninterrupted_scheduler = (
             _new_fsdp2_runner()
         )
+        uninterrupted_gradient_scaler = _gradient_scaler(16, device="cpu")
+        assert uninterrupted_gradient_scaler is not None
         _seed_rank_training_rng(rank)
         uninterrupted_losses = _train_steps(
             uninterrupted_model,
@@ -207,14 +236,20 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             uninterrupted_scheduler,
             step_count=6,
             accumulation_steps=2,
+            gradient_scaler=uninterrupted_gradient_scaler,
         )
         uninterrupted_model_state = _snapshot(uninterrupted_model.state_dict())
         uninterrupted_optimizer_state = _snapshot(uninterrupted_optimizer.state_dict())
         uninterrupted_scheduler_state = _snapshot(uninterrupted_scheduler.state_dict())
+        uninterrupted_gradient_scaler_state = _snapshot(
+            uninterrupted_gradient_scaler.state_dict()
+        )
 
         interrupted_model, interrupted_optimizer, interrupted_scheduler = (
             _new_fsdp2_runner()
         )
+        interrupted_gradient_scaler = _gradient_scaler(16, device="cpu")
+        assert interrupted_gradient_scaler is not None
         _seed_rank_training_rng(rank)
         _train_steps(
             interrupted_model,
@@ -222,6 +257,7 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             interrupted_scheduler,
             step_count=3,
             accumulation_steps=2,
+            gradient_scaler=interrupted_gradient_scaler,
         )
         adapter = FSDP2CheckpointRunnerAdapter.from_process_group(
             training_config={
@@ -229,6 +265,7 @@ def _fsdp2_worker(rank: int, root: str) -> None:
                 "accumulate_grad_batches": 2,
                 "epoch_steps": 3,
                 "model": "tiny-fsdp2",
+                "precision": 16,
                 "scheduler": "CosineAnnealingLR",
                 "seed": 20260801,
             },
@@ -240,6 +277,7 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             model=interrupted_model,
             optimizer=interrupted_optimizer,
             scheduler=interrupted_scheduler,
+            gradient_scaler=interrupted_gradient_scaler,
             global_step=3,
             next_epoch=1,
         )
@@ -248,11 +286,29 @@ def _fsdp2_worker(rank: int, root: str) -> None:
         np.random.random()
         torch.rand(9)
         resumed_model, resumed_optimizer, resumed_scheduler = _new_fsdp2_runner()
+        resumed_model_before_restore = _snapshot(resumed_model.state_dict())
+        with pytest.raises(
+            CheckpointContractError,
+            match="gradient scaler enabled state does not match",
+        ):
+            adapter.restore(
+                checkpoint,
+                model=resumed_model,
+                optimizer=resumed_optimizer,
+                scheduler=resumed_scheduler,
+            )
+        _assert_nested_equal(
+            _snapshot(resumed_model.state_dict()),
+            resumed_model_before_restore,
+        )
+        resumed_gradient_scaler = _gradient_scaler(16, device="cpu")
+        assert resumed_gradient_scaler is not None
         progress = adapter.restore(
             checkpoint,
             model=resumed_model,
             optimizer=resumed_optimizer,
             scheduler=resumed_scheduler,
+            gradient_scaler=resumed_gradient_scaler,
         )
         resumed_losses = _train_steps(
             resumed_model,
@@ -260,6 +316,7 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             resumed_scheduler,
             step_count=3,
             accumulation_steps=2,
+            gradient_scaler=resumed_gradient_scaler,
         )
 
         assert progress.global_step == 3
@@ -282,6 +339,10 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             _snapshot(resumed_scheduler.state_dict()),
             uninterrupted_scheduler_state,
         )
+        _assert_nested_equal(
+            _snapshot(resumed_gradient_scaler.state_dict()),
+            uninterrupted_gradient_scaler_state,
+        )
         assert manifest.backend.strategy == "fsdp2"
         assert manifest.backend.state_dict_type == "sharded"
         assert manifest.backend.world_size == 2
@@ -294,6 +355,10 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             == "torch-distributed-checkpoint-optimizer-v1"
         )
         assert manifest.states["rng"].serialization == "torch-rng-state-per-rank-v1"
+        assert (
+            manifest.states["gradient_scaler"].serialization
+            == "torch-grad-scaler-json-v1"
+        )
 
         divergent_checkpoint = root_path / "checkpoints" / "divergent-scheduler"
         try:
@@ -302,6 +367,7 @@ def _fsdp2_worker(rank: int, root: str) -> None:
                 model=resumed_model,
                 optimizer=resumed_optimizer,
                 scheduler=_RankDivergentScheduler(rank),
+                gradient_scaler=resumed_gradient_scaler,
                 global_step=6,
                 next_epoch=2,
             )
@@ -321,6 +387,7 @@ def _fsdp2_worker(rank: int, root: str) -> None:
                 model=resumed_model,
                 optimizer=resumed_optimizer,
                 scheduler=resumed_scheduler,
+                gradient_scaler=resumed_gradient_scaler,
                 global_step=6 if rank == 0 else 9,
                 next_epoch=2 if rank == 0 else 3,
             )

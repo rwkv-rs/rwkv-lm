@@ -26,6 +26,11 @@ STATE_FILES = {
         "rwkv-callback-schedule-v1",
         b'{"global_step":12}',
     ),
+    "gradient_scaler": (
+        "gradient-scaler.json",
+        "torch-grad-scaler-json-v1",
+        b'{"enabled":false,"state_dict":{}}',
+    ),
     "rng": ("rng.pt", "torch-rng-state", b"rng-state"),
     "data_cursor": (
         "data-cursor.json",
@@ -137,6 +142,12 @@ def test_legacy_pth_is_only_an_explicit_opaque_converter_input(
             "scheduler serialization",
         ),
         (
+            lambda raw: raw["states"]["gradient_scaler"].update(
+                serialization="torch-state-dict"
+            ),
+            "gradient_scaler serialization",
+        ),
+        (
             lambda raw: raw["backend"].update(world_size=True),
             "world_size",
         ),
@@ -214,6 +225,11 @@ def test_standard_loader_cross_checks_scheduler_and_data_cursor(
     [
         ("scheduler", b'{"global_step":12.0}', "scheduler state global_step"),
         (
+            "gradient_scaler",
+            b'{"enabled":true,"state_dict":{}}',
+            "enabled gradient scaler state_dict",
+        ),
+        (
             "data_cursor",
             (
                 b'{"next_epoch":3,"samples_per_epoch":40320,'
@@ -223,7 +239,7 @@ def test_standard_loader_cross_checks_scheduler_and_data_cursor(
         ),
     ],
 )
-def test_standard_loader_rejects_non_integer_artifact_progress(
+def test_standard_loader_rejects_malformed_state_artifacts(
     tmp_path: Path,
     component: str,
     payload: bytes,
@@ -258,6 +274,28 @@ def test_loader_does_not_fallback_from_invalid_standard(
             tmp_path,
             allow_legacy_pth_for_conversion=True,
         )
+
+
+def test_manifest_requires_fp16_gradient_scaler_state(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    config_path = tmp_path / manifest.training_config.path
+    config_path.write_text(
+        '{"ctx_len":1024,"precision":16}',
+        encoding="utf-8",
+    )
+    mismatched = CheckpointManifest(
+        backend=manifest.backend,
+        progress=manifest.progress,
+        training_config=ArtifactRecord.from_file(
+            tmp_path,
+            manifest.training_config.path,
+            serialization="canonical-json",
+        ),
+        states=manifest.states,
+    )
+
+    with pytest.raises(CheckpointContractError, match="match training precision"):
+        mismatched.verify_artifacts(tmp_path)
 
 
 @pytest.mark.parametrize(

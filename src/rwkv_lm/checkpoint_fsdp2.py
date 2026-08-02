@@ -36,11 +36,13 @@ from .checkpoint_runner import (
     _canonical_json_bytes,
     _capture_rng_state,
     _fsync_directory,
+    _gradient_scaler_payload,
     _require_compatible_training_config,
     _restore_rng_state,
     _torch_load,
     _torch_save,
     _validate_rng_state,
+    _validate_gradient_scaler_restore,
     _write_canonical_json,
 )
 
@@ -165,6 +167,7 @@ class FSDP2CheckpointRunnerAdapter:
         global_step: int,
         next_epoch: int,
         scheduler: Stateful | None = None,
+        gradient_scaler: Stateful | None = None,
     ) -> CheckpointManifest:
         """Collectively publish a complete sharded epoch checkpoint."""
 
@@ -218,6 +221,18 @@ class FSDP2CheckpointRunnerAdapter:
             ),
         )
         _require_consensus(scheduler_bytes, "scheduler state")
+        gradient_scaler_payload = _collective_phase(
+            "serialize gradient scaler state",
+            lambda: _gradient_scaler_payload(gradient_scaler),
+        )
+        gradient_scaler_bytes = _collective_phase(
+            "canonicalize gradient scaler state",
+            lambda: _canonical_json_bytes(
+                gradient_scaler_payload,
+                "gradient scaler state",
+            ),
+        )
+        _require_consensus(gradient_scaler_bytes, "gradient scaler state")
 
         staging = _create_staging(destination)
         try:
@@ -273,6 +288,10 @@ class FSDP2CheckpointRunnerAdapter:
                     scheduler_payload,
                 )
                 _write_canonical_json(
+                    staging / "gradient-scaler.json",
+                    gradient_scaler_payload,
+                )
+                _write_canonical_json(
                     staging / "training-config.json",
                     self.training_config,
                 )
@@ -304,6 +323,11 @@ class FSDP2CheckpointRunnerAdapter:
                         staging,
                         "scheduler.json",
                         serialization=scheduler_serialization,
+                    ),
+                    "gradient_scaler": ArtifactRecord.from_file(
+                        staging,
+                        "gradient-scaler.json",
+                        serialization="torch-grad-scaler-json-v1",
                     ),
                     "rng": ArtifactRecord.from_tree(
                         staging,
@@ -368,6 +392,7 @@ class FSDP2CheckpointRunnerAdapter:
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: Stateful | None = None,
+        gradient_scaler: Stateful | None = None,
     ) -> TrainingProgress:
         """Collectively restore verified FSDP2 and per-rank runtime state."""
 
@@ -425,6 +450,15 @@ class FSDP2CheckpointRunnerAdapter:
                 (checkpoint_dir / manifest.states["scheduler"].path).read_bytes()
             ),
         )
+        gradient_scaler_payload = _collective_phase(
+            "read replicated gradient scaler state",
+            lambda: json.loads(
+                (
+                    checkpoint_dir
+                    / manifest.states["gradient_scaler"].path
+                ).read_bytes()
+            ),
+        )
         data_cursor = _collective_phase(
             "read FSDP2 data cursor",
             lambda: json.loads(
@@ -444,6 +478,13 @@ class FSDP2CheckpointRunnerAdapter:
                 manifest.states["scheduler"].serialization,
                 scheduler_payload,
                 scheduler,
+            ),
+        )
+        gradient_scaler_state = _collective_phase(
+            "validate replicated gradient scaler state",
+            lambda: _validate_gradient_scaler_restore(
+                gradient_scaler_payload,
+                gradient_scaler,
             ),
         )
         normalized_rng = _collective_phase(
@@ -509,6 +550,13 @@ class FSDP2CheckpointRunnerAdapter:
             _collective_phase(
                 "apply replicated scheduler state",
                 lambda: scheduler.load_state_dict(scheduler_state),
+            )
+        if gradient_scaler is not None:
+            _collective_phase(
+                "apply replicated gradient scaler state",
+                lambda: gradient_scaler.load_state_dict(
+                    gradient_scaler_state
+                ),
             )
         _collective_phase(
             "restore per-rank RNG state",

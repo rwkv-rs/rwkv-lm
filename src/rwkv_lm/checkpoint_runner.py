@@ -34,6 +34,10 @@ _STATE_PATHS = {
     "model": ("model.pt", "torch-state-dict"),
     "optimizer": ("optimizer.pt", "torch-optimizer-state"),
     "scheduler": ("scheduler.json", "rwkv-callback-schedule-v1"),
+    "gradient_scaler": (
+        "gradient-scaler.json",
+        "torch-grad-scaler-json-v1",
+    ),
     "rng": ("rng.pt", "torch-rng-state"),
     "data_cursor": ("data-cursor.json", "rwkv-binidx-epoch-cursor-v1"),
 }
@@ -90,6 +94,7 @@ class EpochCheckpointRunnerAdapter:
         global_step: int,
         next_epoch: int,
         scheduler: Stateful | None = None,
+        gradient_scaler: Stateful | None = None,
     ) -> CheckpointManifest:
         """Publish all resume state together, or leave no final checkpoint."""
 
@@ -134,6 +139,10 @@ class EpochCheckpointRunnerAdapter:
             _write_canonical_json(
                 staging / _STATE_PATHS["scheduler"][0],
                 scheduler_payload,
+            )
+            _write_canonical_json(
+                staging / _STATE_PATHS["gradient_scaler"][0],
+                _gradient_scaler_payload(gradient_scaler),
             )
             _torch_save(_capture_rng_state(), staging / _STATE_PATHS["rng"][0])
             _write_canonical_json(
@@ -186,6 +195,7 @@ class EpochCheckpointRunnerAdapter:
         model: Stateful,
         optimizer: Stateful,
         scheduler: Stateful | None = None,
+        gradient_scaler: Stateful | None = None,
     ) -> TrainingProgress:
         """Restore a verified complete checkpoint into an initialized runner."""
 
@@ -219,6 +229,11 @@ class EpochCheckpointRunnerAdapter:
         scheduler_payload = json.loads(
             (checkpoint_dir / manifest.states["scheduler"].path).read_bytes()
         )
+        gradient_scaler_payload = json.loads(
+            (
+                checkpoint_dir / manifest.states["gradient_scaler"].path
+            ).read_bytes()
+        )
         data_cursor = json.loads(
             (checkpoint_dir / manifest.states["data_cursor"].path).read_bytes()
         )
@@ -248,11 +263,17 @@ class EpochCheckpointRunnerAdapter:
             raise CheckpointContractError(
                 "RWKV callback schedule checkpoint does not accept a Torch scheduler"
             )
+        gradient_scaler_state = _validate_gradient_scaler_restore(
+            gradient_scaler_payload,
+            gradient_scaler,
+        )
 
         model.load_state_dict(model_state, strict=True)
         optimizer.load_state_dict(optimizer_state)
         if scheduler is not None:
             scheduler.load_state_dict(scheduler_state)
+        if gradient_scaler is not None:
+            gradient_scaler.load_state_dict(gradient_scaler_state)
         _restore_rng_state(normalized_rng)
         return manifest.progress
 
@@ -343,6 +364,65 @@ def _require_compatible_training_config(
     raise CheckpointContractError(
         "checkpoint training config does not match the requested runner"
     )
+
+
+def _gradient_scaler_payload(
+    gradient_scaler: Stateful | None,
+) -> dict[str, object]:
+    if gradient_scaler is None:
+        return {"enabled": False, "state_dict": {}}
+    is_enabled = getattr(gradient_scaler, "is_enabled", None)
+    if not callable(is_enabled):
+        raise CheckpointContractError(
+            "gradient scaler must provide is_enabled()"
+        )
+    enabled = is_enabled()
+    if not isinstance(enabled, bool):
+        raise CheckpointContractError(
+            "gradient scaler is_enabled() must return bool"
+        )
+    state_dict = gradient_scaler.state_dict()
+    if not isinstance(state_dict, Mapping):
+        raise CheckpointContractError(
+            "gradient scaler state_dict must be a mapping"
+        )
+    return {
+        "enabled": enabled,
+        "state_dict": dict(state_dict),
+    }
+
+
+def _validate_gradient_scaler_restore(
+    payload: object,
+    gradient_scaler: Stateful | None,
+) -> Mapping[str, object]:
+    if not isinstance(payload, Mapping):
+        raise CheckpointContractError(
+            "checkpoint gradient scaler state must be a mapping"
+        )
+    enabled = payload.get("enabled")
+    state_dict = payload.get("state_dict")
+    if not isinstance(enabled, bool) or not isinstance(state_dict, Mapping):
+        raise CheckpointContractError(
+            "checkpoint gradient scaler state has invalid values"
+        )
+    runtime_enabled = False
+    if gradient_scaler is not None:
+        is_enabled = getattr(gradient_scaler, "is_enabled", None)
+        if not callable(is_enabled):
+            raise CheckpointContractError(
+                "gradient scaler must provide is_enabled()"
+            )
+        runtime_enabled = is_enabled()
+        if not isinstance(runtime_enabled, bool):
+            raise CheckpointContractError(
+                "gradient scaler is_enabled() must return bool"
+            )
+    if runtime_enabled != enabled:
+        raise CheckpointContractError(
+            "checkpoint gradient scaler enabled state does not match the runtime"
+        )
+    return state_dict
 
 
 def _write_canonical_json(path: Path, value: object) -> None:

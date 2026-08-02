@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.utils.data import DataLoader
 
 from .checkpoint import CheckpointContractError
@@ -85,6 +86,7 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
         betas=args.betas,
         eps=args.adam_eps,
     )
+    gradient_scaler = _gradient_scaler(args.precision)
     checkpoint_config = dict(_checkpoint_training_config(args))
     checkpoint_config.update(
         {
@@ -104,6 +106,7 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
             Path(resume_checkpoint),
             model=model,
             optimizer=optimizer,
+            gradient_scaler=gradient_scaler,
         )
         if (
             progress.epoch != int(args.epoch_begin)
@@ -176,6 +179,7 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
                 microbatches,
                 forward_loss=forward_loss,
                 grad_clip=args.grad_clip,
+                gradient_scaler=gradient_scaler,
             )
             global_step += 1
             optimizer_steps_this_epoch += 1
@@ -210,6 +214,7 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
                 Path(args.proj_dir) / "checkpoints" / f"epoch-{next_epoch:08d}",
                 model=model,
                 optimizer=optimizer,
+                gradient_scaler=gradient_scaler,
                 global_step=global_step,
                 next_epoch=next_epoch,
             )
@@ -272,6 +277,7 @@ def _run_accumulated_optimizer_step(
     *,
     forward_loss: Callable[[_T, int], torch.Tensor],
     grad_clip: float,
+    gradient_scaler: torch.amp.GradScaler | None = None,
 ) -> torch.Tensor:
     """Run one FSDP2 optimizer step over one effective global batch."""
 
@@ -296,14 +302,23 @@ def _run_accumulated_optimizer_step(
             raise CheckpointContractError(
                 "FSDP2 training_step must return a scalar Torch loss"
             )
-        (loss / accumulation_steps).backward()
+        scaled_loss = loss / accumulation_steps
+        if gradient_scaler is not None:
+            scaled_loss = gradient_scaler.scale(scaled_loss)
+        scaled_loss.backward()
         detached_loss = loss.detach().float() / accumulation_steps
         mean_loss = (
             detached_loss if mean_loss is None else mean_loss + detached_loss
         )
 
+    if gradient_scaler is not None:
+        gradient_scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    optimizer.step()
+    if gradient_scaler is None:
+        optimizer.step()
+    else:
+        gradient_scaler.step(optimizer)
+        gradient_scaler.update()
     assert mean_loss is not None
     return mean_loss
 
@@ -380,6 +395,21 @@ def _autocast_context(precision):
         return lambda: torch.autocast("cuda", dtype=torch.float16)
     if precision == 32:
         return contextlib.nullcontext
+    raise CheckpointContractError(f"unsupported FSDP2 precision: {precision!r}")
+
+
+def _gradient_scaler(
+    precision,
+    *,
+    device: str = "cuda",
+) -> ShardedGradScaler | None:
+    if precision == 16:
+        return ShardedGradScaler(
+            device=device,
+            process_group=dist.group.WORLD,
+        )
+    if precision in {"bf16", 32}:
+        return None
     raise CheckpointContractError(f"unsupported FSDP2 precision: {precision!r}")
 
 
