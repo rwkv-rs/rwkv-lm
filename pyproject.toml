@@ -18,6 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
+rwkv-convert-legacy-checkpoint = "rwkv_lm.standard_model:converter_main"
 rwkv-train = "rwkv_lm.cli:main"
 
 [tool.setuptools.packages.find]
