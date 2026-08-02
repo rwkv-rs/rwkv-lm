@@ -38,10 +38,13 @@ def test_duplicate_generic_training_stack_is_removed() -> None:
         "cli.py",
         "fsdp2_trainer.py",
         "peft.py",
+        "train.py",
         "trainer.py",
     }
 
     assert not removed_modules.intersection(path.name for path in package.iterdir())
+    assert not (ROOT / "train.py").exists()
+    assert not list(ROOT.glob("demo-training-run*.sh"))
 
 
 def test_hosted_cpu_contract_installs_public_fla_and_runs_full_unit_suite() -> None:

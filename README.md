@@ -22,23 +22,26 @@ rwkv-convert-legacy-checkpoint legacy-model.pth out/rwkv-init
 ## Train
 
 The debug flavor is a self-contained synthetic-data configuration that starts
-from random weights and enables complete TorchTitan checkpoints:
+from random weights and enables complete TorchTitan checkpoints. The canonical
+launcher follows TorchTitan's `MODULE`/`CONFIG` contract:
 
 ```bash
-rwkv-train \
-  --module rwkv_lm.models.rwkv7 \
-  --config rwkv7_debugmodel
+NGPU=1 CONFIG=rwkv7_debugmodel ./run_train.sh
 ```
 
 The production flavor requires an existing standard Transformers model
 directory and an RWKV binidx dataset. It fails closed when either input is
-missing. `demo-training-run.sh` is the canonical TorchTitan launch; set:
+missing:
 
 ```bash
 export RWKV_HF_ASSETS_PATH=/path/to/standard-rwkv7
 export RWKV_BINIDX_PATH=/path/to/tokenized-dataset-prefix
 export RWKV_MAGIC_PRIME=81082817
-./demo-training-run.sh
+CONFIG=rwkv7_1_5b ./run_train.sh \
+  --hf-assets-path "${RWKV_HF_ASSETS_PATH}" \
+  --checkpoint.initial-load-path "${RWKV_HF_ASSETS_PATH}" \
+  --dataloader.dataset-path "${RWKV_BINIDX_PATH}" \
+  --dataloader.magic-prime "${RWKV_MAGIC_PRIME}"
 ```
 
 TorchTitan checkpoints own the model, optimizer, scheduler, training step, and
