@@ -1,9 +1,110 @@
+import copy
+import hashlib
+import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
 import pytest
 import torch
 from torchtitan.components.lora import LoRAConverter
 
 from rwkv_lm.models.rwkv7 import model_registry
-from rwkv_lm.models.rwkv7.state_dict_adapter import Rwkv7StateDictAdapter
+from rwkv_lm.models.rwkv7.state_dict_adapter import (
+    AdapterCheckpointError,
+    Rwkv7StateDictAdapter,
+)
+
+_SOURCE_REVISION = "1" * 40
+_OTHER_REVISION = "2" * 40
+
+
+def _lora_spec():
+    return model_registry(
+        "debugmodel",
+        converters=[
+            LoRAConverter.Config(
+                rank=2,
+                alpha=4.0,
+                target_modules=["receptance"],
+            )
+        ],
+    )
+
+
+def _write_transformers_artifact(
+    path: Path,
+    *,
+    source_revision: str = _SOURCE_REVISION,
+) -> str:
+    path.mkdir()
+    config = {
+        "architectures": ["Rwkv7ForCausalLM"],
+        "hidden_size": 128,
+        "model_type": "rwkv7",
+    }
+    tokenizer = b'{"version":"1.0"}\n'
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (path / "tokenizer.json").write_bytes(tokenizer)
+    tokenizer_files = {"tokenizer.json": hashlib.sha256(tokenizer).hexdigest()}
+    identity_payload = {
+        "checkpoint_sha256": "3" * 64,
+        "config": config,
+        "source_revision": source_revision,
+        "tokenizer_files": tokenizer_files,
+    }
+    model_identity = hashlib.sha256(
+        json.dumps(
+            identity_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    conversion = {**identity_payload, "model_identity": model_identity}
+    (path / "rwkv7_conversion.json").write_text(
+        json.dumps(conversion),
+        encoding="utf-8",
+    )
+    return model_identity
+
+
+def _initialized_lora_model():
+    model = _lora_spec().model.build()
+    model.init_states()
+    return model
+
+
+def _state_snapshot(model) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+    }
+
+
+def _assert_state_unchanged(
+    model,
+    snapshot: dict[str, torch.Tensor],
+) -> None:
+    assert model.state_dict().keys() == snapshot.keys()
+    assert all(
+        torch.equal(tensor, snapshot[name])
+        for name, tensor in model.state_dict().items()
+    )
+
+
+def _source_and_exact_base_target():
+    source = _initialized_lora_model()
+    target = _initialized_lora_model()
+    with torch.no_grad():
+        source.layers["0"].att.receptance.lora_a.weight.fill_(0.25)
+        source.layers["0"].att.receptance.lora_b.weight.fill_(0.5)
+        source.layers["1"].att.receptance.lora_a.weight.fill_(0.75)
+        source.layers["1"].att.receptance.lora_b.weight.fill_(1.0)
+        target.load_state_dict(source.state_dict(), strict=True)
+        for name, parameter in target.named_parameters():
+            if ".lora_" in name:
+                parameter.zero_()
+    return source, target
 
 
 def test_transformers_state_dict_names_round_trip() -> None:
@@ -46,16 +147,7 @@ def test_unknown_state_dict_name_fails_closed() -> None:
 
 
 def test_lora_state_exports_as_merged_transformers_weight() -> None:
-    spec = model_registry(
-        "debugmodel",
-        converters=[
-            LoRAConverter.Config(
-                rank=2,
-                alpha=4.0,
-                target_modules=["receptance"],
-            )
-        ],
-    )
+    spec = _lora_spec()
     model = spec.model.build()
     model.init_states()
     adapter = Rwkv7StateDictAdapter(spec.model, None)
@@ -76,35 +168,125 @@ def test_lora_state_exports_as_merged_transformers_weight() -> None:
     assert not any("lora_" in name for name in hf_state)
 
 
-def test_lora_adapter_only_state_loads_and_preserves_inference() -> None:
-    spec = model_registry(
-        "debugmodel",
-        converters=[
-            LoRAConverter.Config(
-                rank=2,
-                alpha=4.0,
-                target_modules=["receptance"],
-            )
-        ],
-    )
-    source = spec.model.build()
-    source.init_states()
-    target = spec.model.build()
-    target.init_states()
-    adapter = Rwkv7StateDictAdapter(spec.model, None)
-    with torch.no_grad():
-        source.layers["0"].att.receptance.lora_a.weight.fill_(0.25)
-        source.layers["0"].att.receptance.lora_b.weight.fill_(0.5)
-        target.load_state_dict(source.state_dict(), strict=True)
-        target.layers["0"].att.receptance.lora_a.weight.zero_()
-        target.layers["0"].att.receptance.lora_b.weight.zero_()
-    adapter_state = adapter.adapter_state_dict(source.state_dict())
-    adapter.load_adapter_state_dict(target, adapter_state)
+def test_adapter_checkpoint_binds_full_base_and_preserves_inference(
+    tmp_path: Path,
+) -> None:
+    model_identity = _write_transformers_artifact(tmp_path / "artifact")
+    spec = _lora_spec()
+    source, target = _source_and_exact_base_target()
+    adapter = Rwkv7StateDictAdapter(spec.model, str(tmp_path / "artifact"))
+
+    checkpoint = adapter.adapter_checkpoint(source)
+    checkpoint_path = tmp_path / "adapter.pt"
+    torch.save(checkpoint, checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    adapter.load_adapter_checkpoint(target, checkpoint)
     inputs = torch.randn(2, 3, spec.model.hidden_size)
 
-    assert adapter_state
-    assert all(".lora_" in name for name in adapter_state)
+    assert checkpoint["base"]["model_identity"] == model_identity
+    assert checkpoint["base"]["source_revision"] == _SOURCE_REVISION
+    assert len(checkpoint["base"]["state_inventory"]) == 69
+    assert list(checkpoint["state_dict"]) == [
+        "layers.0.att.receptance.lora_a.weight",
+        "layers.0.att.receptance.lora_b.weight",
+        "layers.1.att.receptance.lora_a.weight",
+        "layers.1.att.receptance.lora_b.weight",
+    ]
+    assert all(
+        torch.equal(source.state_dict()[name], target.state_dict()[name])
+        for name in checkpoint["state_dict"]
+    )
     assert torch.equal(
         source.layers["0"].att.receptance(inputs),
         target.layers["0"].att.receptance(inputs),
     )
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(
+            lambda checkpoint: checkpoint["base"].__setitem__(
+                "model_identity", "4" * 64
+            ),
+            id="wrong-base-identity",
+        ),
+        pytest.param(
+            lambda checkpoint: checkpoint["base"].__setitem__(
+                "source_revision", _OTHER_REVISION
+            ),
+            id="wrong-source-revision",
+        ),
+        pytest.param(
+            lambda checkpoint: checkpoint["state_dict"].__setitem__(
+                next(iter(checkpoint["state_dict"])),
+                next(iter(checkpoint["state_dict"].values())).double(),
+            ),
+            id="float64",
+        ),
+        pytest.param(
+            lambda checkpoint: checkpoint["state_dict"].__setitem__(
+                next(iter(checkpoint["state_dict"])),
+                next(iter(checkpoint["state_dict"].values())).to(torch.int32),
+            ),
+            id="integer-dtype",
+        ),
+        pytest.param(
+            lambda checkpoint: checkpoint["adapter"].__setitem__(
+                "storage_device", "cuda"
+            ),
+            id="wrong-storage-device-policy",
+        ),
+        pytest.param(
+            lambda checkpoint: checkpoint["state_dict"].pop(
+                next(iter(checkpoint["state_dict"]))
+            ),
+            id="missing-key",
+        ),
+        pytest.param(
+            lambda checkpoint: checkpoint["state_dict"].__setitem__(
+                "layers.0.att.receptance.lora_extra.weight",
+                torch.zeros(1),
+            ),
+            id="extra-key",
+        ),
+        pytest.param(
+            lambda checkpoint: checkpoint["state_dict"].__setitem__(
+                "layers.1.att.receptance.lora_b.weight",
+                checkpoint["state_dict"]["layers.1.att.receptance.lora_b.weight"][:-1],
+            ),
+            id="lexical-last-wrong-shape",
+        ),
+    ],
+)
+def test_invalid_adapter_checkpoint_fails_before_any_model_mutation(
+    tmp_path: Path,
+    corrupt: Callable[[dict[str, Any]], Any],
+) -> None:
+    _write_transformers_artifact(tmp_path / "artifact")
+    source, target = _source_and_exact_base_target()
+    adapter = Rwkv7StateDictAdapter(_lora_spec().model, str(tmp_path / "artifact"))
+    checkpoint = copy.deepcopy(adapter.adapter_checkpoint(source))
+    corrupt(checkpoint)
+    before = _state_snapshot(target)
+
+    with pytest.raises(AdapterCheckpointError):
+        adapter.load_adapter_checkpoint(target, checkpoint)
+
+    _assert_state_unchanged(target, before)
+
+
+def test_adapter_checkpoint_rejects_different_base_without_mutation(
+    tmp_path: Path,
+) -> None:
+    _write_transformers_artifact(tmp_path / "artifact")
+    source, _exact_target = _source_and_exact_base_target()
+    different_base = _initialized_lora_model()
+    adapter = Rwkv7StateDictAdapter(_lora_spec().model, str(tmp_path / "artifact"))
+    checkpoint = adapter.adapter_checkpoint(source)
+    before = _state_snapshot(different_base)
+
+    with pytest.raises(AdapterCheckpointError, match="base state digest"):
+        adapter.load_adapter_checkpoint(different_base, checkpoint)
+
+    _assert_state_unchanged(different_base, before)
