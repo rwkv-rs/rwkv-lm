@@ -15,6 +15,7 @@ from rwkv_lm.models.rwkv7.config_registry import (
     rwkv7_debugmodel,
 )
 from rwkv_lm.models.rwkv7.data import RwkvDataLoader
+from rwkv_lm.models.rwkv7.state_dict_adapter import AdapterCheckpointError
 
 
 def test_model_registry_returns_torchtitan_model_spec() -> None:
@@ -33,7 +34,7 @@ def test_config_registry_returns_trainer_config() -> None:
     assert config.model_spec is not None
     assert config.model_spec.name == "rwkv7"
     assert config.parallelism.enable_sequence_parallel is False
-    assert config.hf_assets_path == "."
+    assert config.hf_assets_path == ""
     assert isinstance(config.dataloader, RwkvDataLoader.Config)
     assert config.dataloader.dataset == "synthetic"
     assert config.checkpoint.enable is True
@@ -56,6 +57,21 @@ def test_production_config_fails_closed_without_standard_hf_assets(
     config = rwkv7_1_5b()
 
     with pytest.raises(FileNotFoundError, match="standard transformers-rwkv"):
+        config.model_spec.model.update_from_config(config=config)
+
+
+def test_hf_checkpoint_rejects_weights_without_canonical_conversion_identity(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(model_module, "initialize_rwkv7_runtime", lambda: None)
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"not-read-by-preflight")
+    config = rwkv7_1_5b()
+    config.hf_assets_path = str(tmp_path)
+    config.checkpoint.initial_load_path = str(tmp_path)
+
+    with pytest.raises(AdapterCheckpointError, match="rwkv7_conversion"):
         config.model_spec.model.update_from_config(config=config)
 
 

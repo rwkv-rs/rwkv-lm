@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -6,15 +7,25 @@ import torch
 import torch.distributed.checkpoint as dcp
 
 from rwkv_lm.binidx import MMapIndexedDataset, data_file_path, index_file_path
-from rwkv_lm.models.rwkv7.data import RwkvDataLoader, RwkvTokenizer
+from rwkv_lm.models.rwkv7.data import (
+    RwkvDataLoader,
+    RwkvPretokenizedTokenizer,
+)
+from rwkv_lm.models.rwkv7.state_dict_adapter import AdapterCheckpointError
 
 
-def _tokenizer(vocab_size: int = 1_024) -> RwkvTokenizer:
-    return RwkvTokenizer.Config(vocab_size=vocab_size).build(tokenizer_path=".")
+def _tokenizer(
+    tokenizer_path: Path,
+    vocab_size: int = 1_024,
+) -> RwkvPretokenizedTokenizer:
+    return RwkvPretokenizedTokenizer.Config(vocab_size=vocab_size).build(
+        tokenizer_path=str(tokenizer_path)
+    )
 
 
 def _loader(
     config: RwkvDataLoader.Config,
+    tokenizer_path: Path,
     *,
     seq_len: int = 16,
     local_batch_size: int = 2,
@@ -22,7 +33,7 @@ def _loader(
     return config.build(
         dp_world_size=1,
         dp_rank=0,
-        tokenizer=_tokenizer(config.vocab_size),
+        tokenizer=_tokenizer(tokenizer_path, config.vocab_size),
         seq_len=seq_len,
         local_batch_size=local_batch_size,
         snapshot_every_n_steps=1,
@@ -51,7 +62,10 @@ def _assert_batches_equal(
     assert torch.equal(expected_labels, observed_labels)
 
 
-def test_synthetic_dataloader_emits_positions_and_resumes_cursor() -> None:
+def test_synthetic_dataloader_emits_positions_and_resumes_cursor(
+    rwkv7_artifact_factory,
+) -> None:
+    artifact_path, _model_identity = rwkv7_artifact_factory()
     config = RwkvDataLoader.Config(
         dataset="synthetic",
         vocab_size=1_024,
@@ -59,12 +73,12 @@ def test_synthetic_dataloader_emits_positions_and_resumes_cursor() -> None:
         infinite=False,
         num_batches=3,
     )
-    loader = _loader(config)
+    loader = _loader(config, artifact_path)
     iterator = iter(loader)
     first = next(iterator)
     state = loader.state_dict()
     expected_next = next(iterator)
-    resumed = _loader(config)
+    resumed = _loader(config, artifact_path)
     resumed.load_state_dict(state)
     observed_next = next(iter(resumed))
     incompatible = _loader(
@@ -74,7 +88,8 @@ def test_synthetic_dataloader_emits_positions_and_resumes_cursor() -> None:
             seed=8,
             infinite=False,
             num_batches=3,
-        )
+        ),
+        artifact_path,
     )
 
     inputs, labels = first
@@ -85,7 +100,11 @@ def test_synthetic_dataloader_emits_positions_and_resumes_cursor() -> None:
         incompatible.load_state_dict(state)
 
 
-def test_binidx_dataloader_is_stateful_and_requires_real_inputs(tmp_path) -> None:
+def test_binidx_dataloader_is_stateful_and_requires_real_inputs(
+    tmp_path,
+    rwkv7_artifact_factory,
+) -> None:
+    artifact_path, _model_identity = rwkv7_artifact_factory(vocab_size=64)
     prefix = tmp_path / "tokens"
     tokens = np.arange(49, dtype=np.int32)
     _write_binidx(prefix, tokens)
@@ -96,7 +115,7 @@ def test_binidx_dataloader_is_stateful_and_requires_real_inputs(tmp_path) -> Non
         magic_prime=11,
         infinite=True,
     )
-    loader = _loader(config, seq_len=4)
+    loader = _loader(config, artifact_path, seq_len=4)
     first_inputs, first_labels = next(iter(loader))
 
     assert first_inputs["input"].shape == first_labels.shape == (2, 4)
@@ -104,24 +123,65 @@ def test_binidx_dataloader_is_stateful_and_requires_real_inputs(tmp_path) -> Non
 
     missing = RwkvDataLoader.Config(dataset="binidx", vocab_size=64)
     with pytest.raises(ValueError, match="--dataloader.dataset-path"):
-        _loader(missing, seq_len=4)
+        _loader(missing, artifact_path, seq_len=4)
 
 
-def test_dcp_restores_dataloader_cursor(tmp_path) -> None:
+def test_dcp_restores_dataloader_cursor(tmp_path, rwkv7_artifact_factory) -> None:
+    artifact_path, _model_identity = rwkv7_artifact_factory(vocab_size=128)
     config = RwkvDataLoader.Config(
         dataset="synthetic",
         vocab_size=128,
         seed=11,
         infinite=True,
     )
-    loader = _loader(config)
+    loader = _loader(config, artifact_path)
     next(iter(loader))
     checkpoint = tmp_path / "dcp"
     dcp.save({"dataloader": loader}, checkpoint_id=str(checkpoint))
     expected_next = next(iter(loader))
 
-    resumed = _loader(config)
+    resumed = _loader(config, artifact_path)
     dcp.load({"dataloader": resumed}, checkpoint_id=str(checkpoint))
     observed_next = next(iter(resumed))
 
     _assert_batches_equal(expected_next, observed_next)
+
+
+def test_pretokenized_tokenizer_requires_canonical_assets_and_rejects_text(
+    tmp_path: Path,
+    rwkv7_artifact_factory,
+) -> None:
+    artifact_path, model_identity = rwkv7_artifact_factory()
+    tokenizer = _tokenizer(artifact_path)
+
+    assert tokenizer.model_identity == model_identity
+    assert tokenizer.get_vocab_size() == 1_024
+    with pytest.raises(RuntimeError, match="pretokenized-only"):
+        tokenizer.encode("must not be byte-mapped")
+    with pytest.raises(RuntimeError, match="pretokenized-only"):
+        tokenizer.decode([1, 2, 3])
+    with pytest.raises(AdapterCheckpointError, match="requires readable"):
+        _tokenizer(tmp_path / "missing")
+
+
+def test_pretokenized_tokenizer_rejects_tampered_assets(
+    rwkv7_artifact_factory,
+) -> None:
+    artifact_path, _model_identity = rwkv7_artifact_factory()
+    (artifact_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(AdapterCheckpointError, match="digest does not match"):
+        _tokenizer(artifact_path)
+
+
+def test_pretokenized_tokenizer_rejects_forged_model_identity(
+    rwkv7_artifact_factory,
+) -> None:
+    artifact_path, _model_identity = rwkv7_artifact_factory()
+    conversion_path = artifact_path / "rwkv7_conversion.json"
+    conversion = json.loads(conversion_path.read_text(encoding="utf-8"))
+    conversion["model_identity"] = "f" * 64
+    conversion_path.write_text(json.dumps(conversion), encoding="utf-8")
+
+    with pytest.raises(AdapterCheckpointError, match="canonical conversion"):
+        _tokenizer(artifact_path)

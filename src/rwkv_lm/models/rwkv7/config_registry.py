@@ -11,7 +11,7 @@ from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.trainer import Trainer
 
 from . import model_registry
-from .data import RwkvDataLoader, RwkvTokenizer
+from .data import RwkvDataLoader, RwkvPretokenizedTokenizer
 
 
 def _training_config(
@@ -27,8 +27,8 @@ def _training_config(
     model_spec = model_registry(flavor)
     return Trainer.Config(
         model_spec=model_spec,
-        hf_assets_path=".",
-        tokenizer=RwkvTokenizer.Config(vocab_size=vocab_size),
+        hf_assets_path="",
+        tokenizer=RwkvPretokenizedTokenizer.Config(vocab_size=vocab_size),
         loss=CrossEntropyLoss.Config(global_vocab_size=model_spec.model.vocab_size),
         optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,15 @@ class AdapterCheckpointError(ValueError):
     """Raised before an unsafe or incompatible adapter checkpoint is applied."""
 
 
+@dataclass(frozen=True, slots=True)
+class Rwkv7ArtifactIdentity:
+    """Canonical transformers-rwkv identity consumed by training artifacts."""
+
+    model_identity: str
+    source_revision: str
+    vocab_size: int
+
+
 def validate_rwkv7_hf_checkpoint(config: Any) -> None:
     """Fail before model construction when an HF initial checkpoint is incomplete."""
     if not config.checkpoint.initial_load_in_hf:
@@ -54,7 +64,7 @@ def validate_rwkv7_hf_checkpoint(config: Any) -> None:
             "RWKV initial_load_in_hf requires a standard transformers-rwkv "
             f"checkpoint; missing {missing}"
         )
-    _rwkv7_artifact_identity(checkpoint_path)
+    validate_rwkv7_artifact(checkpoint_path)
 
 
 def _rename_prefix(
@@ -124,7 +134,7 @@ class Rwkv7StateDictAdapter(StateDictAdapter):
 
     def adapter_checkpoint(self, model: Rwkv7Model) -> dict[str, Any]:
         """Build an adapter-only checkpoint bound to one immutable base artifact."""
-        model_identity, source_revision = _rwkv7_artifact_identity(self.hf_assets_path)
+        identity = validate_rwkv7_artifact(self.hf_assets_path)
         state_dict = model.state_dict()
         adapter_names = self._adapter_names()
         _validate_state_key_inventory(state_dict, adapter_names)
@@ -143,8 +153,8 @@ class Rwkv7StateDictAdapter(StateDictAdapter):
             "format": _ADAPTER_FORMAT,
             "schema_version": _ADAPTER_SCHEMA_VERSION,
             "base": {
-                "model_identity": model_identity,
-                "source_revision": source_revision,
+                "model_identity": identity.model_identity,
+                "source_revision": identity.source_revision,
                 "state_digest": _state_digest(base_state, owner="RWKV base state"),
                 "state_inventory": _state_inventory(base_state),
             },
@@ -184,12 +194,12 @@ class Rwkv7StateDictAdapter(StateDictAdapter):
             )
         base_metadata = _validate_base_metadata(payload["base"])
         adapter_metadata = _validate_adapter_metadata(payload["adapter"])
-        model_identity, source_revision = _rwkv7_artifact_identity(self.hf_assets_path)
-        if base_metadata["model_identity"] != model_identity:
+        identity = validate_rwkv7_artifact(self.hf_assets_path)
+        if base_metadata["model_identity"] != identity.model_identity:
             raise AdapterCheckpointError(
                 "RWKV adapter base model identity does not match the loaded artifact"
             )
-        if base_metadata["source_revision"] != source_revision:
+        if base_metadata["source_revision"] != identity.source_revision:
             raise AdapterCheckpointError(
                 "RWKV adapter base source revision does not match the loaded artifact"
             )
@@ -277,12 +287,12 @@ class Rwkv7StateDictAdapter(StateDictAdapter):
         return names
 
 
-def _rwkv7_artifact_identity(
+def validate_rwkv7_artifact(
     hf_assets_path: str | Path | None,
-) -> tuple[str, str]:
+) -> Rwkv7ArtifactIdentity:
     if hf_assets_path is None:
         raise AdapterCheckpointError(
-            "RWKV adapter checkpoints require a transformers-rwkv artifact path"
+            "RWKV artifact validation requires a transformers-rwkv artifact path"
         )
     artifact_path = Path(hf_assets_path)
     conversion_path = artifact_path / "rwkv7_conversion.json"
@@ -301,6 +311,11 @@ def _rwkv7_artifact_identity(
     ):
         raise AdapterCheckpointError(
             "RWKV artifact config must describe Rwkv7ForCausalLM"
+        )
+    vocab_size = config.get("vocab_size")
+    if type(vocab_size) is not int or vocab_size <= 1:
+        raise AdapterCheckpointError(
+            "RWKV artifact config requires vocab_size greater than one"
         )
     normalized_config = dict(config)
     normalized_config.pop("_name_or_path", None)
@@ -370,7 +385,37 @@ def _rwkv7_artifact_identity(
         raise AdapterCheckpointError(
             "RWKV model identity does not match canonical conversion metadata"
         )
-    return model_identity, source_revision
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            artifact_path,
+            local_files_only=True,
+            trust_remote_code=False,
+            use_fast=True,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise AdapterCheckpointError(
+            "RWKV artifact requires a valid local fast tokenizer"
+        ) from error
+    if not tokenizer.is_fast or len(tokenizer) != vocab_size:
+        raise AdapterCheckpointError(
+            "RWKV tokenizer must be fast and match the model vocabulary"
+        )
+    special_token_ids = {
+        tokenizer.bos_token_id,
+        tokenizer.eos_token_id,
+        tokenizer.pad_token_id,
+    }
+    if special_token_ids != {0}:
+        raise AdapterCheckpointError(
+            "RWKV tokenizer BOS/EOS/PAD token ids must all be zero"
+        )
+    return Rwkv7ArtifactIdentity(
+        model_identity=model_identity,
+        source_revision=source_revision,
+        vocab_size=vocab_size,
+    )
 
 
 def _validate_state_key_inventory(
@@ -572,6 +617,8 @@ def _lower_hex(raw: Any, *, length: int, owner: str) -> str:
 
 __all__ = [
     "AdapterCheckpointError",
+    "Rwkv7ArtifactIdentity",
     "Rwkv7StateDictAdapter",
+    "validate_rwkv7_artifact",
     "validate_rwkv7_hf_checkpoint",
 ]

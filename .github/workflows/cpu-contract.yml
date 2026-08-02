@@ -1,0 +1,37 @@
+name: CPU contract
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.11.14
+          enable-cache: true
+      - name: Verify lockfile
+        run: uv lock --check
+      - name: Install CPU contract environment
+        run: >-
+          uv sync --frozen --group dev
+          --no-install-package flash-rwkv
+      - name: Lint and format
+        run: |
+          uv run --frozen --no-sync ruff check .
+          uv run --frozen --no-sync ruff format --check .
+      - name: Test Module, Config, adapter, and DCP contracts
+        run: uv run --frozen --no-sync pytest -q tests/unit_tests
+      - name: Verify generated diff
+        run: git diff --check

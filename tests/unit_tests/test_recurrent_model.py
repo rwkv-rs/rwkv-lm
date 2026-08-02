@@ -7,7 +7,10 @@ from torch.nn import functional as F
 from rwkv_lm.models.rwkv7 import model as model_module
 from rwkv_lm.models.rwkv7 import model_registry
 from rwkv_lm.models.rwkv7.config_registry import rwkv7_debugmodel
-from rwkv_lm.models.rwkv7.data import RwkvDataLoader, RwkvTokenizer
+from rwkv_lm.models.rwkv7.data import (
+    RwkvDataLoader,
+    RwkvPretokenizedTokenizer,
+)
 from rwkv_lm.models.rwkv7.model import (
     Rwkv7Block,
     Rwkv7Model,
@@ -37,8 +40,12 @@ def _fake_block_forward(
     return output, v_first, next_shift, next_wkv, next_shift + ffn_shift * 0.0
 
 
-def test_real_dataloader_batch_reaches_model_loss_and_backward(monkeypatch) -> None:
+def test_real_dataloader_batch_reaches_model_loss_and_backward(
+    monkeypatch,
+    rwkv7_artifact_factory,
+) -> None:
     monkeypatch.setattr(Rwkv7Block, "forward", _fake_block_forward)
+    artifact_path, _model_identity = rwkv7_artifact_factory()
     model = _model()
     loader = RwkvDataLoader.Config(
         dataset="synthetic",
@@ -48,7 +55,9 @@ def test_real_dataloader_batch_reaches_model_loss_and_backward(monkeypatch) -> N
     ).build(
         dp_world_size=1,
         dp_rank=0,
-        tokenizer=RwkvTokenizer.Config(vocab_size=1_024).build(tokenizer_path="."),
+        tokenizer=RwkvPretokenizedTokenizer.Config(vocab_size=1_024).build(
+            tokenizer_path=str(artifact_path)
+        ),
         seq_len=32,
         local_batch_size=2,
         snapshot_every_n_steps=1,

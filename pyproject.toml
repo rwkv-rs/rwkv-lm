@@ -18,6 +18,12 @@ dependencies = [
     "wandb",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "ruff>=0.16.0",
+]
+
 [project.scripts]
 rwkv-convert-legacy-checkpoint = "transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf:main"
 rwkv-train = "torchtitan.train:main"

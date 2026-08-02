@@ -1,6 +1,4 @@
 import copy
-import hashlib
-import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -30,43 +28,6 @@ def _lora_spec():
             )
         ],
     )
-
-
-def _write_transformers_artifact(
-    path: Path,
-    *,
-    source_revision: str = _SOURCE_REVISION,
-) -> str:
-    path.mkdir()
-    config = {
-        "architectures": ["Rwkv7ForCausalLM"],
-        "hidden_size": 128,
-        "model_type": "rwkv7",
-    }
-    tokenizer = b'{"version":"1.0"}\n'
-    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    (path / "tokenizer.json").write_bytes(tokenizer)
-    tokenizer_files = {"tokenizer.json": hashlib.sha256(tokenizer).hexdigest()}
-    identity_payload = {
-        "checkpoint_sha256": "3" * 64,
-        "config": config,
-        "source_revision": source_revision,
-        "tokenizer_files": tokenizer_files,
-    }
-    model_identity = hashlib.sha256(
-        json.dumps(
-            identity_payload,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
-    conversion = {**identity_payload, "model_identity": model_identity}
-    (path / "rwkv7_conversion.json").write_text(
-        json.dumps(conversion),
-        encoding="utf-8",
-    )
-    return model_identity
 
 
 def _initialized_lora_model():
@@ -170,11 +131,12 @@ def test_lora_state_exports_as_merged_transformers_weight() -> None:
 
 def test_adapter_checkpoint_binds_full_base_and_preserves_inference(
     tmp_path: Path,
+    rwkv7_artifact_factory,
 ) -> None:
-    model_identity = _write_transformers_artifact(tmp_path / "artifact")
+    artifact_path, model_identity = rwkv7_artifact_factory()
     spec = _lora_spec()
     source, target = _source_and_exact_base_target()
-    adapter = Rwkv7StateDictAdapter(spec.model, str(tmp_path / "artifact"))
+    adapter = Rwkv7StateDictAdapter(spec.model, str(artifact_path))
 
     checkpoint = adapter.adapter_checkpoint(source)
     checkpoint_path = tmp_path / "adapter.pt"
@@ -260,12 +222,12 @@ def test_adapter_checkpoint_binds_full_base_and_preserves_inference(
     ],
 )
 def test_invalid_adapter_checkpoint_fails_before_any_model_mutation(
-    tmp_path: Path,
+    rwkv7_artifact_factory,
     corrupt: Callable[[dict[str, Any]], Any],
 ) -> None:
-    _write_transformers_artifact(tmp_path / "artifact")
+    artifact_path, _model_identity = rwkv7_artifact_factory()
     source, target = _source_and_exact_base_target()
-    adapter = Rwkv7StateDictAdapter(_lora_spec().model, str(tmp_path / "artifact"))
+    adapter = Rwkv7StateDictAdapter(_lora_spec().model, str(artifact_path))
     checkpoint = copy.deepcopy(adapter.adapter_checkpoint(source))
     corrupt(checkpoint)
     before = _state_snapshot(target)
@@ -277,12 +239,12 @@ def test_invalid_adapter_checkpoint_fails_before_any_model_mutation(
 
 
 def test_adapter_checkpoint_rejects_different_base_without_mutation(
-    tmp_path: Path,
+    rwkv7_artifact_factory,
 ) -> None:
-    _write_transformers_artifact(tmp_path / "artifact")
+    artifact_path, _model_identity = rwkv7_artifact_factory()
     source, _exact_target = _source_and_exact_base_target()
     different_base = _initialized_lora_model()
-    adapter = Rwkv7StateDictAdapter(_lora_spec().model, str(tmp_path / "artifact"))
+    adapter = Rwkv7StateDictAdapter(_lora_spec().model, str(artifact_path))
     checkpoint = adapter.adapter_checkpoint(source)
     before = _state_snapshot(different_base)
 

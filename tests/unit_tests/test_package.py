@@ -33,3 +33,15 @@ def test_duplicate_generic_training_stack_is_removed() -> None:
     }
 
     assert not removed_modules.intersection(path.name for path in package.iterdir())
+
+
+def test_hosted_cpu_contract_installs_public_fla_and_runs_full_unit_suite() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    workflow = (ROOT / ".github" / "workflows" / "cpu-contract.yml").read_text()
+
+    assert {"pytest>=9.0.0", "ruff>=0.16.0"} <= set(project["dependency-groups"]["dev"])
+    assert "--no-install-package flash-rwkv" in workflow
+    assert "--no-install-package flash-linear-attention" not in workflow
+    assert "pytest -q tests/unit_tests" in workflow
+    assert "ruff format --check ." in workflow
+    assert "uv lock --check" in workflow
