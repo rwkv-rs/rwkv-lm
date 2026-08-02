@@ -199,17 +199,10 @@ class EpochCheckpointRunnerAdapter:
                 "runner restore requires a complete standard checkpoint"
             )
         checkpoint_dir = plan.source
-        expected_config = _canonical_json_bytes(
-            self.training_config,
-            "training config",
-        )
         actual_config = (
             (checkpoint_dir / manifest.training_config.path).read_bytes().rstrip(b"\n")
         )
-        if actual_config != expected_config:
-            raise CheckpointContractError(
-                "checkpoint training config does not match the requested runner"
-            )
+        _require_compatible_training_config(actual_config, self.training_config)
 
         model_state = _torch_load(
             checkpoint_dir / manifest.states["model"].path,
@@ -322,6 +315,34 @@ def _canonical_json_bytes(value: object, owner: str) -> bytes:
         raise CheckpointContractError(
             f"{owner} must contain canonical JSON values"
         ) from error
+
+
+def _require_compatible_training_config(
+    actual: bytes,
+    expected: Mapping[str, object],
+) -> None:
+    """Accept the pre-accumulation config only for its implicit default of one."""
+
+    expected_bytes = _canonical_json_bytes(expected, "training config")
+    if actual == expected_bytes:
+        return
+    try:
+        actual_config = json.loads(actual)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise CheckpointContractError(
+            "checkpoint training config is not canonical JSON"
+        ) from error
+    if (
+        isinstance(actual_config, dict)
+        and "accumulate_grad_batches" not in actual_config
+        and expected.get("accumulate_grad_batches") == 1
+    ):
+        actual_config["accumulate_grad_batches"] = 1
+        if _canonical_json_bytes(actual_config, "training config") == expected_bytes:
+            return
+    raise CheckpointContractError(
+        "checkpoint training config does not match the requested runner"
+    )
 
 
 def _write_canonical_json(path: Path, value: object) -> None:

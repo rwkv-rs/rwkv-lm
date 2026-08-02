@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import TypeVar
 
@@ -62,10 +62,7 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
         raise CheckpointContractError(
             "torchrun WORLD_SIZE must equal num_nodes * devices for FSDP2"
         )
-    if int(getattr(args, "accumulate_grad_batches", 1)) != 1:
-        raise CheckpointContractError(
-            "standard checkpoint v1 requires accumulate_grad_batches=1"
-        )
+    accumulation_steps = _gradient_accumulation_steps(args)
 
     local_rank = _local_cuda_rank()
     torch.cuda.set_device(local_rank)
@@ -147,22 +144,41 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
         train_data.world_size = world_size
         stop_after_epoch = False
         epoch_loss = 0.0
+        optimizer_steps_this_epoch = 0
 
-        for batch_idx, batch in enumerate(data_loader):
+        for optimizer_step_idx, microbatches in enumerate(
+            _accumulation_windows(data_loader, accumulation_steps)
+        ):
+            if optimizer_step_idx >= int(args.epoch_steps):
+                raise CheckpointContractError(
+                    "FSDP2 data loader produced more microbatches than the "
+                    "declared epoch_steps and accumulation contract"
+                )
             lr, reached_token_limit = scheduled_learning_rate(args, global_step)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr * param_group["my_lr_scale"]
                 if param_group["weight_decay"] > 0:
                     param_group["weight_decay"] = args.weight_decay
 
-            inputs, targets = (tensor.to(device, non_blocking=True) for tensor in batch)
-            optimizer.zero_grad(set_to_none=True)
-            with autocast():
-                loss = model.training_step((inputs, targets), batch_idx)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            def forward_loss(batch, microbatch_offset):
+                inputs, targets = (
+                    tensor.to(device, non_blocking=True) for tensor in batch
+                )
+                batch_idx = (
+                    optimizer_step_idx * accumulation_steps + microbatch_offset
+                )
+                with autocast():
+                    return model.training_step((inputs, targets), batch_idx)
+
+            loss = _run_accumulated_optimizer_step(
+                model,
+                optimizer,
+                microbatches,
+                forward_loss=forward_loss,
+                grad_clip=args.grad_clip,
+            )
             global_step += 1
+            optimizer_steps_this_epoch += 1
 
             reduced_loss = loss.detach().float()
             dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
@@ -172,14 +188,17 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
                 args.magic_prime // args.real_bsz
             )
             if reached_token_limit or magic_limit:
-                if batch_idx + 1 != int(args.epoch_steps):
+                if optimizer_step_idx + 1 != int(args.epoch_steps):
                     raise CheckpointContractError(
                         "standard checkpoint v1 cannot stop and save inside an epoch"
                     )
                 stop_after_epoch = True
 
         next_epoch = epoch + 1
-        if global_step != next_epoch * int(args.epoch_steps):
+        if (
+            optimizer_steps_this_epoch != int(args.epoch_steps)
+            or global_step != next_epoch * int(args.epoch_steps)
+        ):
             raise CheckpointContractError(
                 "FSDP2 runner did not finish the declared epoch boundary"
             )
@@ -210,6 +229,83 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
     dist.barrier()
     if args.wandb:
         _rank_zero_phase("finish W&B", lambda: wandb_run.finish())
+
+
+def _gradient_accumulation_steps(args) -> int:
+    accumulation_steps = getattr(args, "accumulate_grad_batches", 1)
+    if (
+        isinstance(accumulation_steps, bool)
+        or not isinstance(accumulation_steps, int)
+        or accumulation_steps <= 0
+    ):
+        raise CheckpointContractError(
+            "accumulate_grad_batches must be a positive integer"
+        )
+    return accumulation_steps
+
+
+def _accumulation_windows(
+    batches: Iterable[_T],
+    accumulation_steps: int,
+) -> Iterator[tuple[_T, ...]]:
+    """Group a complete epoch into fixed optimizer-step windows."""
+
+    iterator = iter(batches)
+    while True:
+        window = []
+        for _ in range(accumulation_steps):
+            try:
+                window.append(next(iterator))
+            except StopIteration:
+                if window:
+                    raise CheckpointContractError(
+                        "FSDP2 data loader ended inside a gradient accumulation window"
+                    ) from None
+                return
+        yield tuple(window)
+
+
+def _run_accumulated_optimizer_step(
+    model: FSDPModule,
+    optimizer: torch.optim.Optimizer,
+    microbatches: Sequence[_T],
+    *,
+    forward_loss: Callable[[_T, int], torch.Tensor],
+    grad_clip: float,
+) -> torch.Tensor:
+    """Run one FSDP2 optimizer step over one effective global batch."""
+
+    if not isinstance(model, FSDPModule):
+        raise CheckpointContractError(
+            "gradient accumulation requires a fully_shard-wrapped model"
+        )
+    if not microbatches:
+        raise CheckpointContractError(
+            "gradient accumulation requires at least one microbatch"
+        )
+
+    optimizer.zero_grad(set_to_none=True)
+    mean_loss = None
+    accumulation_steps = len(microbatches)
+    for microbatch_offset, batch in enumerate(microbatches):
+        synchronize = microbatch_offset + 1 == accumulation_steps
+        model.set_requires_gradient_sync(synchronize)
+        model.set_reshard_after_backward(synchronize)
+        loss = forward_loss(batch, microbatch_offset)
+        if not isinstance(loss, torch.Tensor) or loss.ndim != 0:
+            raise CheckpointContractError(
+                "FSDP2 training_step must return a scalar Torch loss"
+            )
+        (loss / accumulation_steps).backward()
+        detached_loss = loss.detach().float() / accumulation_steps
+        mean_loss = (
+            detached_loss if mean_loss is None else mean_loss + detached_loss
+        )
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    assert mean_loss is not None
+    return mean_loss
 
 
 def _require_torchrun_environment() -> None:

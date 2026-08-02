@@ -44,7 +44,11 @@ class MyDataset(Dataset):
         assert args.magic_prime / dataset_slot > 0.9 and args.magic_prime / dataset_slot <= 1
 
     def __len__(self):
-        return self.args.epoch_steps * self.args.micro_bsz
+        return (
+            self.args.epoch_steps
+            * self.args.micro_bsz
+            * self.args.accumulate_grad_batches
+        )
 
     def __getitem__(self, idx):
         args = self.args

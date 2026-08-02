@@ -23,6 +23,10 @@ from rwkv_lm.checkpoint import (
     select_checkpoint_loader,
 )
 from rwkv_lm.checkpoint_fsdp2 import FSDP2CheckpointRunnerAdapter
+from rwkv_lm.fsdp2_trainer import (
+    _accumulation_windows,
+    _run_accumulated_optimizer_step,
+)
 
 
 class _RankDivergentScheduler:
@@ -69,17 +73,26 @@ def _train_steps(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     *,
     step_count: int,
+    accumulation_steps: int,
 ) -> list[float]:
     losses = []
     for _ in range(step_count):
-        inputs = torch.randn(4, 4)
-        offset = random.random() + float(np.random.random())
-        targets = inputs[:, :2] * 0.25 + offset
-        optimizer.zero_grad(set_to_none=True)
-        loss = (model(inputs) - targets).square().mean()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        microbatches = []
+        for _ in range(accumulation_steps):
+            inputs = torch.randn(2, 4)
+            offset = random.random() + float(np.random.random())
+            targets = inputs[:, :2] * 0.25 + offset
+            microbatches.append((inputs, targets))
+
+        loss = _run_accumulated_optimizer_step(
+            model,
+            optimizer,
+            microbatches,
+            forward_loss=lambda batch, _: (model(batch[0]) - batch[1])
+            .square()
+            .mean(),
+            grad_clip=1.0,
+        )
         scheduler.step()
         losses.append(float(loss.detach()))
     return losses
@@ -117,6 +130,22 @@ def _assert_nested_equal(actual: object, expected: object) -> None:
         assert actual == expected
 
 
+def _assert_model_state_close(actual: nn.Module, expected: nn.Module) -> None:
+    actual_state = _snapshot(actual.state_dict())
+    expected_state = _snapshot(expected.state_dict())
+    assert isinstance(actual_state, Mapping)
+    assert isinstance(expected_state, Mapping)
+    assert actual_state.keys() == expected_state.keys()
+    for name in expected_state:
+        torch.testing.assert_close(
+            actual_state[name],
+            expected_state[name],
+            rtol=1e-6,
+            atol=1e-7,
+            msg=lambda message, name=name: f"{name}: {message}",
+        )
+
+
 def _fsdp2_worker(rank: int, root: str) -> None:
     root_path = Path(root)
     torch.set_num_threads(1)
@@ -127,6 +156,47 @@ def _fsdp2_worker(rank: int, root: str) -> None:
         world_size=2,
     )
     try:
+        accumulated_model, accumulated_optimizer, _ = _new_fsdp2_runner()
+        reference_model, reference_optimizer, _ = _new_fsdp2_runner()
+        first_inputs = torch.randn(2, 4)
+        second_inputs = torch.randn(2, 4)
+        first_targets = first_inputs[:, :2] * 0.25 + 0.75
+        second_targets = second_inputs[:, :2] * 0.25 - 0.25
+        accumulated_loss = _run_accumulated_optimizer_step(
+            accumulated_model,
+            accumulated_optimizer,
+            (
+                (first_inputs, first_targets),
+                (second_inputs, second_targets),
+            ),
+            forward_loss=lambda batch, _: (
+                accumulated_model(batch[0]) - batch[1]
+            )
+            .square()
+            .mean(),
+            grad_clip=0.05,
+        )
+        reference_inputs = torch.cat((first_inputs, second_inputs))
+        reference_targets = torch.cat((first_targets, second_targets))
+        reference_loss = _run_accumulated_optimizer_step(
+            reference_model,
+            reference_optimizer,
+            ((reference_inputs, reference_targets),),
+            forward_loss=lambda batch, _: (
+                reference_model(batch[0]) - batch[1]
+            )
+            .square()
+            .mean(),
+            grad_clip=0.05,
+        )
+        torch.testing.assert_close(
+            accumulated_loss,
+            reference_loss,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+        _assert_model_state_close(accumulated_model, reference_model)
+
         uninterrupted_model, uninterrupted_optimizer, uninterrupted_scheduler = (
             _new_fsdp2_runner()
         )
@@ -136,6 +206,7 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             uninterrupted_optimizer,
             uninterrupted_scheduler,
             step_count=6,
+            accumulation_steps=2,
         )
         uninterrupted_model_state = _snapshot(uninterrupted_model.state_dict())
         uninterrupted_optimizer_state = _snapshot(uninterrupted_optimizer.state_dict())
@@ -150,10 +221,12 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             interrupted_optimizer,
             interrupted_scheduler,
             step_count=3,
+            accumulation_steps=2,
         )
         adapter = FSDP2CheckpointRunnerAdapter.from_process_group(
             training_config={
                 "batch_size": 8,
+                "accumulate_grad_batches": 2,
                 "epoch_steps": 3,
                 "model": "tiny-fsdp2",
                 "scheduler": "CosineAnnealingLR",
@@ -186,6 +259,7 @@ def _fsdp2_worker(rank: int, root: str) -> None:
             resumed_optimizer,
             resumed_scheduler,
             step_count=3,
+            accumulation_steps=2,
         )
 
         assert progress.global_step == 3
@@ -329,3 +403,9 @@ def test_fsdp2_world_size_two_resume_matches_uninterrupted_trajectory(
     model_shard.write_bytes(model_shard.read_bytes() + b"tampered")
     with pytest.raises(CheckpointContractError, match="artifact (size|digest)"):
         select_checkpoint_loader(checkpoint)
+
+
+def test_accumulation_windows_reject_partial_effective_batch() -> None:
+    assert list(_accumulation_windows(range(6), 3)) == [(0, 1, 2), (3, 4, 5)]
+    with pytest.raises(CheckpointContractError, match="inside a gradient accumulation"):
+        list(_accumulation_windows(range(5), 3))

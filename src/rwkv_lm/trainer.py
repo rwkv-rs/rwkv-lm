@@ -17,6 +17,7 @@ from .checkpoint_runner import EpochCheckpointRunnerAdapter
 
 
 _CHECKPOINT_CONFIG_FIELDS = (
+    "accumulate_grad_batches",
     "adam_eps",
     "beta1",
     "beta2",

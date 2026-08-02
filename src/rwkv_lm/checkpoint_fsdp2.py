@@ -36,6 +36,7 @@ from .checkpoint_runner import (
     _canonical_json_bytes,
     _capture_rng_state,
     _fsync_directory,
+    _require_compatible_training_config,
     _restore_rng_state,
     _torch_load,
     _torch_save,
@@ -665,10 +666,8 @@ def _epoch_boundary_progress(
 
 
 def _require_equal_training_config(actual: bytes, expected: bytes) -> None:
-    if actual != expected:
-        raise CheckpointContractError(
-            "checkpoint training config does not match the requested runner"
-        )
+    expected_config = json.loads(expected)
+    _require_compatible_training_config(actual, expected_config)
 
 
 def _require_samples_per_epoch(

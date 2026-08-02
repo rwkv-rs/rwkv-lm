@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 from collections.abc import Mapping
 from pathlib import Path
@@ -18,6 +19,7 @@ from rwkv_lm.checkpoint import (
     select_checkpoint_loader,
 )
 from rwkv_lm.checkpoint_runner import EpochCheckpointRunnerAdapter
+from rwkv_lm.dataset import MyDataset
 from rwkv_lm.trainer import scheduled_learning_rate, train_callback
 
 
@@ -247,6 +249,37 @@ def test_interrupted_resume_matches_uninterrupted_training(tmp_path: Path) -> No
     ).complete_resume
 
 
+def test_resume_migrates_implicit_accumulation_default(tmp_path: Path) -> None:
+    model, optimizer = _new_runner()
+    legacy_adapter = _adapter()
+    checkpoint = tmp_path / "epoch-00000001"
+    legacy_adapter.save(
+        checkpoint,
+        model=model,
+        optimizer=optimizer,
+        global_step=3,
+        next_epoch=1,
+    )
+    requested_config = dict(legacy_adapter.training_config)
+    requested_config["accumulate_grad_batches"] = 1
+    current_adapter = EpochCheckpointRunnerAdapter(
+        backend=legacy_adapter.backend,
+        training_config=requested_config,
+        samples_per_epoch=legacy_adapter.samples_per_epoch,
+    )
+
+    resumed_model, resumed_optimizer = _new_runner()
+    progress = current_adapter.restore(
+        checkpoint,
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+    )
+
+    assert progress.global_step == 3
+    _assert_nested_equal(resumed_model.state_dict(), model.state_dict())
+    _assert_nested_equal(resumed_optimizer.state_dict(), optimizer.state_dict())
+
+
 def test_lightning_callback_owns_standard_save_and_resume_boundary(
     tmp_path: Path,
 ) -> None:
@@ -265,6 +298,10 @@ def test_lightning_callback_owns_standard_save_and_resume_boundary(
     assert plan.manifest is not None
     assert plan.manifest.progress.global_step == 3
     assert plan.manifest.progress.epoch == 1
+    training_config = json.loads(
+        (checkpoint / plan.manifest.training_config.path).read_bytes()
+    )
+    assert training_config["accumulate_grad_batches"] == 1
 
     resumed_model, resumed_optimizer = _new_runner()
     resume_trainer = _trainer_state(resumed_optimizer, global_step=0)
@@ -295,6 +332,17 @@ def test_callback_schedule_uses_absolute_global_step() -> None:
     assert resumed_lr == pytest.approx(args.lr_init)
     assert first_stop is False
     assert resumed_stop is False
+
+
+def test_dataset_length_covers_every_accumulated_microbatch() -> None:
+    dataset = object.__new__(MyDataset)
+    dataset.args = SimpleNamespace(
+        accumulate_grad_batches=4,
+        epoch_steps=3,
+        micro_bsz=2,
+    )
+
+    assert len(dataset) == 24
 
 
 def test_transaction_failure_leaves_no_published_or_partial_checkpoint(

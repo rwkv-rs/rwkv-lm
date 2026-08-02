@@ -94,6 +94,11 @@ def main() -> None:
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
+    from .checkpoint import (
+        CheckpointContractError,
+        CheckpointLoadKind,
+        select_checkpoint_loader,
+    )
     from .infctx import InfctxContractError, validate_infctx_chunk_ctx
     from .peft import LoraConfig, PeftContractError
     if "deepspeed" in args.strategy:
@@ -119,7 +124,21 @@ def main() -> None:
     args.log_every_n_steps = int(1e20)
     args.max_epochs = -1  # continue forever
     args.betas = (args.beta1, args.beta2)
-    args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
+    accumulation_steps = args.accumulate_grad_batches
+    if (
+        isinstance(accumulation_steps, bool)
+        or not isinstance(accumulation_steps, int)
+        or accumulation_steps <= 0
+    ):
+        raise CheckpointContractError(
+            "accumulate_grad_batches must be a positive integer"
+        )
+    args.real_bsz = (
+        int(args.num_nodes)
+        * int(args.devices)
+        * args.micro_bsz
+        * accumulation_steps
+    )
     lora_config = LoraConfig.from_namespace(args)
     args.lora_rank = lora_config.rank
     args.lora_alpha = lora_config.alpha
@@ -164,11 +183,6 @@ def main() -> None:
     args.epoch_steps = 40320 // args.real_bsz
     assert args.epoch_steps * args.real_bsz == 40320
 
-    from .checkpoint import (
-        CheckpointContractError,
-        CheckpointLoadKind,
-        select_checkpoint_loader,
-    )
     from .checkpoint_runner import find_latest_training_checkpoint
 
     resume_checkpoint = None
@@ -247,7 +261,7 @@ def main() -> None:
         f"""
 ############################################################################
 #
-# RWKV-7 {args.precision.upper()} on {args.num_nodes}x{args.devices} {args.accelerator.upper()}, bsz {args.num_nodes}x{args.devices}x{args.micro_bsz}={args.real_bsz}, {args.strategy} {'with grad_cp' if args.grad_cp > 0 else ''}
+# RWKV-7 {args.precision.upper()} on {args.num_nodes}x{args.devices} {args.accelerator.upper()}, bsz {args.num_nodes}x{args.devices}x{args.micro_bsz}xaccum{args.accumulate_grad_batches}={args.real_bsz}, {args.strategy} {'with grad_cp' if args.grad_cp > 0 else ''}
 #
 # Data = {args.data_file} ({args.data_type}), ProjDir = {args.proj_dir}
 #
