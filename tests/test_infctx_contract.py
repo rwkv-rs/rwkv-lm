@@ -24,9 +24,12 @@ class _TinyRecurrentBackend(nn.Module):
         self.input_scale = nn.Parameter(torch.tensor(0.7))
         self.readout_scale = nn.Parameter(torch.tensor(1.3))
         self.incoming_state_requires_grad = []
+        self.incoming_tokens_seen = []
+        self.incoming_hidden = []
+        self.reset_calls = 0
 
-    @staticmethod
-    def reset(batch_size: int) -> InfctxState:
+    def reset(self, batch_size: int) -> InfctxState:
+        self.reset_calls += 1
         return InfctxState(
             shift_states=torch.zeros(1, 2, batch_size, 1),
             wkv_states=torch.zeros(1, batch_size, 1, 1, 1),
@@ -41,7 +44,9 @@ class _TinyRecurrentBackend(nn.Module):
         self.incoming_state_requires_grad.append(
             state.shift_states.requires_grad or state.wkv_states.requires_grad
         )
+        self.incoming_tokens_seen.append(state.tokens_seen)
         hidden = state.wkv_states.reshape(values.shape[0], 1)
+        self.incoming_hidden.append(hidden.detach().clone())
         outputs = []
         for token in values.unbind(dim=1):
             hidden = torch.tanh(0.5 * hidden + self.input_scale * token[:, None])
@@ -55,6 +60,13 @@ class _TinyRecurrentBackend(nn.Module):
                 tokens_seen=state.tokens_seen + values.shape[1],
             ),
         )
+
+    @staticmethod
+    def validate_state(state: InfctxState, batch_size: int) -> None:
+        if state.shift_states.shape != (1, 2, batch_size, 1):
+            raise InfctxContractError("tiny infctx shift state shape is invalid")
+        if state.wkv_states.shape != (1, batch_size, 1, 1, 1):
+            raise InfctxContractError("tiny infctx WKV state shape is invalid")
 
 
 def _run(
@@ -71,12 +83,16 @@ def _run(
         boundary=boundary,
         state=state,
         reset_state=lambda: backend.reset(values.shape[0]),
+        validate_state=lambda candidate: backend.validate_state(
+            candidate,
+            values.shape[0],
+        ),
         forward_chunk=backend.forward_chunk,
     )
 
 
 def test_recurrent_chunks_match_one_call_values_and_keep_token_outputs_live() -> None:
-    values = torch.linspace(-1, 1, 32).reshape(1, 32)
+    values = torch.linspace(-1, 1, 48).reshape(1, 48)
     one_call_backend = _TinyRecurrentBackend()
     chunk_backend = copy.deepcopy(one_call_backend)
 
@@ -109,16 +125,22 @@ def test_recurrent_chunks_match_one_call_values_and_keep_token_outputs_live() ->
         rtol=0,
         atol=0,
     )
-    assert chunk_backend.incoming_state_requires_grad == [False, False]
+    assert chunk_backend.incoming_state_requires_grad == [False, False, False]
+    assert chunk_backend.incoming_tokens_seen == [0, 16, 32]
+    assert chunk_backend.reset_calls == 1
+    assert torch.count_nonzero(chunk_backend.incoming_hidden[0]) == 0
+    assert torch.count_nonzero(chunk_backend.incoming_hidden[1]) > 0
+    assert torch.count_nonzero(chunk_backend.incoming_hidden[2]) > 0
     assert chunked.output.requires_grad
     assert not chunked.state.shift_states.requires_grad
     assert not chunked.state.wkv_states.requires_grad
 
 
 def test_response_gradient_matches_one_call_from_detached_prefix_state() -> None:
-    values = torch.linspace(-0.75, 0.75, 32).reshape(1, 32)
+    values = torch.linspace(-0.75, 0.75, 32).reshape(1, 32).requires_grad_()
     chunk_backend = _TinyRecurrentBackend()
     reference_backend = copy.deepcopy(chunk_backend)
+    reference_values = values.detach().clone().requires_grad_()
 
     chunked = _run(
         chunk_backend,
@@ -128,11 +150,11 @@ def test_response_gradient_matches_one_call_from_detached_prefix_state() -> None
     chunk_loss = chunked.output[:, 16:].square().mean()
 
     prefix = reference_backend.forward_chunk(
-        values[:, :16],
-        reference_backend.reset(values.shape[0]),
+        reference_values[:, :16],
+        reference_backend.reset(reference_values.shape[0]),
     )
     response_reference = reference_backend.forward_chunk(
-        values[:, 16:],
+        reference_values[:, 16:],
         prefix.state.detached(),
     )
     reference_loss = response_reference.output.square().mean()
@@ -146,6 +168,16 @@ def test_response_gradient_matches_one_call_from_detached_prefix_state() -> None
     torch.testing.assert_close(chunk_loss, reference_loss, rtol=0, atol=0)
     chunk_loss.backward()
     reference_loss.backward()
+    assert values.grad is not None
+    assert reference_values.grad is not None
+    assert torch.count_nonzero(values.grad[:, :16]) == 0
+    assert torch.count_nonzero(values.grad[:, 16:]) > 0
+    torch.testing.assert_close(
+        values.grad,
+        reference_values.grad,
+        rtol=0,
+        atol=0,
+    )
     for chunk_parameter, reference_parameter in zip(
         chunk_backend.parameters(),
         reference_backend.parameters(),
@@ -173,7 +205,9 @@ def test_continue_carries_state_while_reset_starts_a_new_sequence() -> None:
         boundary=InfctxBoundary.CONTINUE,
         state=first.state,
     )
+    assert backend.reset_calls == 1
     reset = _run(backend, second_values, boundary=InfctxBoundary.RESET)
+    assert backend.reset_calls == 2
     one_call = backend.forward_chunk(
         torch.cat((first_values, second_values), dim=1),
         backend.reset(first_values.shape[0]),
@@ -195,6 +229,7 @@ def test_continue_carries_state_while_reset_starts_a_new_sequence() -> None:
     [
         (0, 32, "positive integer"),
         (32, 32, "smaller than ctx_len"),
+        (16, 33, "ctx_len must be divisible"),
         (8, 32, "divisible"),
     ],
 )
@@ -233,6 +268,7 @@ def test_recurrent_contract_rejects_ambiguous_state_and_silent_padding() -> None
                 wkv_states=state.wkv_states,
                 tokens_seen=1,
             ),
+            validate_state=lambda candidate: backend.validate_state(candidate, 1),
             forward_chunk=backend.forward_chunk,
         )
     with pytest.raises(InfctxContractError, match="silent padding"):
@@ -243,5 +279,32 @@ def test_recurrent_contract_rejects_ambiguous_state_and_silent_padding() -> None
             boundary=InfctxBoundary.RESET,
             state=None,
             reset_state=lambda: backend.reset(1),
+            validate_state=lambda candidate: backend.validate_state(candidate, 1),
             forward_chunk=backend.forward_chunk,
+        )
+
+    def malformed_final_state(
+        values: torch.Tensor,
+        incoming_state: InfctxState,
+    ) -> InfctxResult:
+        result = backend.forward_chunk(values, incoming_state)
+        return InfctxResult(
+            output=result.output,
+            state=InfctxState(
+                shift_states=result.state.shift_states[..., :0],
+                wkv_states=result.state.wkv_states,
+                tokens_seen=result.state.tokens_seen,
+            ),
+        )
+
+    with pytest.raises(InfctxContractError, match="shift state shape"):
+        recurrent_chunk_forward(
+            aligned,
+            chunk_ctx=16,
+            ctx_len=32,
+            boundary=InfctxBoundary.RESET,
+            state=None,
+            reset_state=lambda: backend.reset(1),
+            validate_state=lambda candidate: backend.validate_state(candidate, 1),
+            forward_chunk=malformed_final_state,
         )

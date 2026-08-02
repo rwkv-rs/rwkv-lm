@@ -89,6 +89,10 @@ def validate_infctx_chunk_ctx(
             raise InfctxContractError(f"infctx {name} must be a positive integer")
     if chunk_ctx >= ctx_len:
         raise InfctxContractError("infctx chunk_ctx must be smaller than ctx_len")
+    if ctx_len % kernel_chunk_len != 0:
+        raise InfctxContractError(
+            "infctx ctx_len must be divisible by the backend kernel chunk length"
+        )
     if chunk_ctx % kernel_chunk_len != 0:
         raise InfctxContractError(
             "infctx chunk_ctx must be divisible by the backend kernel chunk length"
@@ -104,6 +108,7 @@ def recurrent_chunk_forward(
     boundary: InfctxBoundary | str,
     state: InfctxState | None,
     reset_state: Callable[[], InfctxState],
+    validate_state: Callable[[InfctxState], None],
     forward_chunk: Callable[[torch.Tensor, InfctxState], InfctxResult],
     kernel_chunk_len: int = 16,
 ) -> InfctxResult:
@@ -113,7 +118,9 @@ def recurrent_chunk_forward(
     a previously returned state. Per-row resets and packed mixed boundaries are
     deliberately outside this contract; callers must form homogeneous batches.
     Token outputs are never detached, so losses on every response chunk retain
-    their local parameter gradients while recurrent history is truncated.
+    their local parameter gradients while recurrent history is truncated. The
+    provider validator sees the detached state that will cross each boundary,
+    including the final state returned to the caller.
     """
 
     chunk_ctx = validate_infctx_chunk_ctx(
@@ -155,6 +162,7 @@ def recurrent_chunk_forward(
             "infctx reset state must start with tokens_seen equal to zero"
         )
     current_state = current_state.detached()
+    validate_state(current_state)
 
     outputs = []
     for input_chunk in input_ids.split(chunk_ctx, dim=1):
@@ -172,8 +180,10 @@ def recurrent_chunk_forward(
             raise InfctxContractError(
                 "infctx backend state tokens_seen did not advance by chunk length"
             )
+        next_state = result.state.detached()
+        validate_state(next_state)
         outputs.append(result.output)
-        current_state = result.state.detached()
+        current_state = next_state
 
     return InfctxResult(
         output=torch.cat(outputs, dim=1),

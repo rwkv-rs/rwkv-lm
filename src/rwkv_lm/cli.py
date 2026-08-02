@@ -154,10 +154,6 @@ def main() -> None:
         )
     if args.train_type == "infctx":
         validate_infctx_chunk_ctx(args.chunk_ctx, ctx_len=args.ctx_len)
-        if args.ctx_len % 16 != 0:
-            raise InfctxContractError(
-                "infctx ctx_len must be divisible by the backend kernel chunk length"
-            )
     elif args.chunk_ctx != 0:
         raise InfctxContractError(
             "chunk_ctx is only valid when train_type is infctx"

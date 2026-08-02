@@ -1425,6 +1425,12 @@ class RWKV(pl.LightningModule):
                 idx.device,
                 self.emb.weight.dtype,
             ),
+            validate_state=lambda state: self._validate_infctx_state(
+                state,
+                batch_size=B,
+                device=idx.device,
+                dtype=self.emb.weight.dtype,
+            ),
             forward_chunk=self.forward_infctx_chunk,
         )
 
