@@ -9,9 +9,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from rwkv_lm import standard_model
 from rwkv_lm.checkpoint import BackendIdentity
 from rwkv_lm.checkpoint_runner import EpochCheckpointRunnerAdapter
-from rwkv_lm import standard_model
+from rwkv_lm.infctx import InfctxBoundary
+from rwkv_lm.peft import LoraConfig, lora_base_state_dict, lora_parameter_names
 from rwkv_lm.standard_model import (
     StandardModelContractError,
     configure_standard_rwkv7_peft,
@@ -26,8 +28,6 @@ from rwkv_lm.standard_model import (
     standard_rwkv7_optimizer_groups,
     standard_rwkv7_training_loss,
 )
-from rwkv_lm.infctx import InfctxBoundary
-from rwkv_lm.peft import LoraConfig, lora_base_state_dict, lora_parameter_names
 
 
 class _FakeConfig:
@@ -670,11 +670,14 @@ def test_missing_standard_dependency_fails_closed(monkeypatch) -> None:
 
     monkeypatch.setattr(standard_model, "import_module", missing)
 
-    with pytest.raises(
-        StandardModelContractError,
-        match="requires transformers-rwkv",
-    ):
+    with pytest.raises(ImportError) as error:
         create_standard_rwkv7_model(_args())
+
+    message = str(error.value)
+    assert standard_model._CONFIG_MODULE in message
+    assert "transformers@eb8248eb9083288e7769518077a1be9c0f7cf7b8" in message
+    assert "flash-linear-attention@1bc262c8c81241e1d339419a31f0aadffa20c210" in message
+    assert "flash-rwkv@866aafd2eed146b0eda1ce03444009ae030f89e3" in message
 
 
 def test_standard_flash_backend_failure_propagates_without_fallback(

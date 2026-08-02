@@ -20,12 +20,12 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
     checkpoint_wrapper,
 )
+from torch.nn import functional as F
 
 from .activation_checkpointing import FSDP2ActivationCheckpointing
 from .checkpoint import CheckpointContractError
@@ -49,6 +49,11 @@ from .peft import (
 _CONFIG_MODULE = "transformers.models.rwkv7.configuration_rwkv7"
 _MODEL_MODULE = "transformers.models.rwkv7.modeling_rwkv7"
 _CONVERTER_MODULE = "transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf"
+_STANDARD_RUNTIME_REVISIONS = {
+    "transformers": "eb8248eb9083288e7769518077a1be9c0f7cf7b8",
+    "flash-linear-attention": "1bc262c8c81241e1d339419a31f0aadffa20c210",
+    "flash-rwkv": "866aafd2eed146b0eda1ce03444009ae030f89e3",
+}
 _STANDARD_LORA_TARGETS = {
     "time_mix.receptance": ("att", "receptance"),
     "time_mix.key": ("att", "key"),
@@ -111,12 +116,12 @@ class StandardRwkv7Config:
     @classmethod
     def from_namespace(cls, args: object) -> StandardRwkv7Config:
         return cls(
-            vocab_size=getattr(args, "vocab_size"),
-            context_length=getattr(args, "ctx_len"),
-            hidden_size=getattr(args, "n_embd"),
-            intermediate_size=getattr(args, "dim_ffn"),
-            num_hidden_layers=getattr(args, "n_layer"),
-            head_size=getattr(args, "head_size"),
+            vocab_size=args.vocab_size,
+            context_length=args.ctx_len,
+            hidden_size=args.n_embd,
+            intermediate_size=args.dim_ffn,
+            num_hidden_layers=args.n_layer,
+            head_size=args.head_size,
             wkv_backend=getattr(args, "wkv_backend", "flash_rwkv"),
         )
 
@@ -255,7 +260,7 @@ def configure_standard_rwkv7_peft(
         raise PeftContractError("standard RWKV-7 PEFT requires LoraConfig")
     if hasattr(model, "_standard_rwkv7_lora_hook_handles"):
         raise PeftContractError("standard RWKV-7 model already has PEFT configured")
-    setattr(model, "lora_config", config)
+    model.lora_config = config
     handles = []
     if config.enabled:
         for block_id, block in enumerate(standard_rwkv7_blocks(model)):
@@ -293,7 +298,7 @@ def configure_standard_rwkv7_peft(
         raise PeftContractError(
             "loading a LoRA adapter requires an enabled standard model"
         )
-    setattr(model, "_standard_rwkv7_lora_hook_handles", handles)
+    model._standard_rwkv7_lora_hook_handles = handles
     return model
 
 
@@ -364,7 +369,7 @@ def prepare_standard_rwkv7_for_fsdp2(
         enabled=activation_checkpointing,
     )
     policy.require_rwkv_blocks(blocks, enabled=activation_checkpointing)
-    setattr(model, "_fsdp2_activation_checkpointing", policy)
+    model._fsdp2_activation_checkpointing = policy
     return blocks
 
 
@@ -792,10 +797,13 @@ def _import_required_module(name: str) -> ModuleType:
     try:
         return import_module(name)
     except ImportError as error:
-        raise StandardModelContractError(
-            "standard RWKV-7 support requires transformers-rwkv with the "
-            "Rwkv7Config/Rwkv7ForCausalLM interface and its fla-rwkv/FlashRWKV "
-            f"dependencies; failed to import {name}: {error}"
+        requirements = ", ".join(
+            f"{package}@{revision}"
+            for package, revision in _STANDARD_RUNTIME_REVISIONS.items()
+        )
+        raise ImportError(
+            "standard RWKV-7 runtime requires exact revisions "
+            f"({requirements}); failed to import {name}: {error}"
         ) from error
 
 
@@ -812,14 +820,14 @@ __all__ = [
     "StandardModelContractError",
     "StandardRwkv7Bindings",
     "StandardRwkv7Config",
-    "convert_legacy_rwkv7_checkpoint",
     "configure_standard_rwkv7_peft",
+    "convert_legacy_rwkv7_checkpoint",
     "create_standard_rwkv7_model",
     "load_standard_rwkv7_bindings",
     "prepare_standard_rwkv7_for_fsdp2",
-    "save_standard_rwkv7_model",
     "save_standard_rwkv7_lora_adapter",
     "save_standard_rwkv7_merged_model",
+    "save_standard_rwkv7_model",
     "standard_rwkv7_blocks",
     "standard_rwkv7_infctx_forward",
     "standard_rwkv7_optimizer_groups",

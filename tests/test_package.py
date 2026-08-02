@@ -6,6 +6,52 @@ import venv
 import zipfile
 from pathlib import Path
 
+import tomllib
+from packaging.requirements import Requirement
+
+_STANDARD_RUNTIME_DIRECT_REQUIREMENTS = {
+    "flash-linear-attention": (
+        frozenset({"cuda"}),
+        (
+            "git+https://github.com/rwkv-rs/fla-rwkv.git@"
+            "1bc262c8c81241e1d339419a31f0aadffa20c210"
+        ),
+    ),
+    "flash-rwkv": (
+        frozenset(),
+        (
+            "git+https://github.com/rwkv-rs/FlashRWKV.git@"
+            "866aafd2eed146b0eda1ce03444009ae030f89e3"
+        ),
+    ),
+    "transformers": (
+        frozenset(),
+        (
+            "git+https://github.com/rwkv-rs/transformers-rwkv.git@"
+            "eb8248eb9083288e7769518077a1be9c0f7cf7b8"
+        ),
+    ),
+}
+
+
+def test_standard_runtime_dependencies_use_exact_direct_revisions() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
+    requirements = [Requirement(value) for value in metadata["project"]["dependencies"]]
+    direct_requirements = {
+        requirement.name: requirement
+        for requirement in requirements
+        if requirement.url is not None
+    }
+
+    assert direct_requirements.keys() == _STANDARD_RUNTIME_DIRECT_REQUIREMENTS.keys()
+    for package, (extras, url) in _STANDARD_RUNTIME_DIRECT_REQUIREMENTS.items():
+        requirement = direct_requirements[package]
+        assert requirement.extras == extras
+        assert requirement.url == url
+        assert not requirement.specifier
+        assert requirement.marker is None
+
 
 def test_package_import_is_cwd_independent_and_does_not_import_torch(tmp_path):
     code = """
