@@ -1,8 +1,16 @@
-from pathlib import Path
+import hashlib
+import shutil
+import subprocess
+import tarfile
+import zipfile
+from pathlib import Path, PurePosixPath
 
 import tomllib
 
 ROOT = Path(__file__).parents[2]
+TORCHTITAN_LICENSE_SHA256 = (
+    "6eea30995941126beeb99ef775f0968ed8320beb4834ad28d6ae6704a1a92930"
+)
 
 
 def test_torchtitan_entrypoints_and_revision_are_authoritative() -> None:
@@ -57,3 +65,52 @@ def test_hosted_cpu_contract_installs_public_fla_and_runs_full_unit_suite() -> N
     assert "pytest -q tests/unit_tests" in workflow
     assert "ruff format --check ." in workflow
     assert "uv lock --check" in workflow
+
+
+def test_distributions_include_the_torchtitan_bsd_license(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    for filename in ("LICENSE", "README.md", "pyproject.toml"):
+        shutil.copy2(ROOT / filename, project / filename)
+    shutil.copytree(
+        ROOT / "src",
+        project / "src",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+
+    output = tmp_path / "dist"
+    subprocess.run(
+        [
+            "uv",
+            "build",
+            "--no-build-logs",
+            "--no-create-gitignore",
+            "--out-dir",
+            str(output),
+            str(project),
+        ],
+        check=True,
+    )
+
+    license_bytes = (ROOT / "LICENSE").read_bytes()
+    assert hashlib.sha256(license_bytes).hexdigest() == TORCHTITAN_LICENSE_SHA256
+
+    (source_distribution,) = output.glob("*.tar.gz")
+    with tarfile.open(source_distribution, "r:gz") as archive:
+        license_members = [
+            member
+            for member in archive.getmembers()
+            if member.isfile() and PurePosixPath(member.name).name == "LICENSE"
+        ]
+        assert len(license_members) == 1
+        extracted_license = archive.extractfile(license_members[0])
+        assert extracted_license is not None
+        assert extracted_license.read() == license_bytes
+
+    (wheel,) = output.glob("*.whl")
+    with zipfile.ZipFile(wheel) as archive:
+        license_paths = [
+            name for name in archive.namelist() if PurePosixPath(name).name == "LICENSE"
+        ]
+        assert len(license_paths) == 1
+        assert archive.read(license_paths[0]) == license_bytes

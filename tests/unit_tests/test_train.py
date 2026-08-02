@@ -10,7 +10,8 @@ def _write_capture_command(path: Path) -> None:
         "#!/usr/bin/bash\n"
         'printf "%s\\n" "$@" > "${RWKV_CAPTURE_PATH}"\n'
         'printf "%s\\n" "${NGPU-}" "${LOCAL_RANK-}" '
-        '"${TORCHFT_LIGHTHOUSE-}" > "${RWKV_CAPTURE_ENV_PATH}"\n',
+        '"${TORCHFT_LIGHTHOUSE-}" "${PYTORCH_ALLOC_CONF-}" '
+        '> "${RWKV_CAPTURE_ENV_PATH}"\n',
         encoding="utf-8",
     )
     path.chmod(0o755)
@@ -24,9 +25,7 @@ def test_run_train_uses_torchtitan_module_and_config_contract(tmp_path) -> None:
     environment = os.environ.copy()
     environment.update(
         {
-            "CONFIG": "rwkv7_1_5b_infctx",
             "LOG_RANK": "0,1",
-            "MODULE": "rwkv_lm.models.rwkv7",
             "NGPU": "4",
             "PATH": f"{tmp_path}:{environment['PATH']}",
             "RWKV_CAPTURE_PATH": str(capture_path),
@@ -63,7 +62,7 @@ def test_run_train_uses_torchtitan_module_and_config_contract(tmp_path) -> None:
         "--module",
         "rwkv_lm.models.rwkv7",
         "--config",
-        "rwkv7_1_5b_infctx",
+        "rwkv7_debugmodel",
         "--training.steps",
         "2",
     ]
@@ -71,6 +70,7 @@ def test_run_train_uses_torchtitan_module_and_config_contract(tmp_path) -> None:
         "4",
         "",
         "http://lighthouse.test:29510",
+        "expandable_segments:True",
     ]
 
 
@@ -119,5 +119,6 @@ def test_run_train_comm_mode_uses_torchtitan_debug_path(tmp_path) -> None:
     assert capture_env_path.read_text(encoding="utf-8").splitlines() == [
         "16",
         "0",
+        "",
         "",
     ]
