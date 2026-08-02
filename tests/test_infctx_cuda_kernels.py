@@ -1,8 +1,10 @@
 import importlib
 import os
+from types import SimpleNamespace
 
 import pytest
 
+from rwkv_lm.infctx import InfctxBoundary
 
 torch = pytest.importorskip("torch")
 
@@ -43,6 +45,30 @@ def _assert_grad_close(actual, expected):
 
 def _clone_with_grad(tensor):
     return tensor.detach().clone().requires_grad_(True)
+
+
+def _tiny_rwkv(model_module):
+    args = SimpleNamespace(
+        chunk_ctx=16,
+        ctx_len=32,
+        dim_att=64,
+        dim_ffn=224,
+        grad_cp=0,
+        head_size=64,
+        my_testing="x070",
+        n_embd=64,
+        n_layer=2,
+        strategy="fsdp2",
+        train_type="infctx",
+        vocab_size=64,
+        weight_decay=0.0,
+    )
+    instance = model_module.RWKV(args).to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        for name, parameter in instance.named_parameters():
+            if name.endswith(("att.output.weight", "ffn.value.weight")):
+                parameter.normal_(mean=0.0, std=0.02)
+    return instance
 
 
 def test_tmix_state_cuda_matches_full_sequence_and_backpropagates_state():
@@ -102,7 +128,7 @@ def test_cmix_state_cuda_matches_full_sequence_and_backpropagates_state():
         chunk_key_weight,
         chunk_value_weight,
     )
-    second, shift2 = model._CmixStateLayerV2Fn.apply(
+    second, _shift2 = model._CmixStateLayerV2Fn.apply(
         chunk_x[:, chunk_ctx:],
         shift1,
         chunk_x_k,
@@ -151,3 +177,65 @@ def test_wkv_statepassing_cuda_matches_full_sequence_and_backpropagates_state():
     torch.testing.assert_close(s0.grad, full_s0.grad, rtol=0, atol=2e-2)
     for chunk_tensor, full_tensor in zip(tensors, full_tensors):
         _assert_grad_close(chunk_tensor.grad, full_tensor.grad)
+
+
+def test_rwkv_infctx_sequence_matches_full_values_and_response_gradients():
+    model_module = _import_model()
+    torch.manual_seed(20260801)
+    full_model = _tiny_rwkv(model_module)
+    chunk_model = _tiny_rwkv(model_module)
+    response_reference = _tiny_rwkv(model_module)
+    chunk_model.load_state_dict(full_model.state_dict())
+    response_reference.load_state_dict(full_model.state_dict())
+    input_ids = torch.randint(0, 64, (1, 32), device="cuda")
+    targets = torch.randint(0, 64, (1, 16), device="cuda")
+
+    full_logits = full_model(input_ids)
+    chunked = chunk_model.forward_infctx_sequence(
+        input_ids,
+        chunk_ctx=16,
+        boundary=InfctxBoundary.RESET,
+    )
+    _assert_close(chunked.output, full_logits)
+    full_loss = torch.nn.functional.cross_entropy(
+        full_logits[:, 16:].reshape(-1, full_logits.shape[-1]).float(),
+        targets.reshape(-1),
+    )
+    chunk_loss = torch.nn.functional.cross_entropy(
+        chunked.output[:, 16:].reshape(-1, chunked.output.shape[-1]).float(),
+        targets.reshape(-1),
+    )
+    torch.testing.assert_close(chunk_loss, full_loss, rtol=5e-3, atol=5e-3)
+    assert not chunked.state.shift_states.requires_grad
+    assert not chunked.state.wkv_states.requires_grad
+
+    prefix = response_reference.forward_infctx_features(
+        input_ids[:, :16],
+        chunk_ctx=16,
+        boundary=InfctxBoundary.RESET,
+    )
+    response = response_reference.forward_infctx_sequence(
+        input_ids[:, 16:],
+        chunk_ctx=16,
+        boundary=InfctxBoundary.CONTINUE,
+        state=prefix.state,
+    )
+    reference_loss = torch.nn.functional.cross_entropy(
+        response.output.reshape(-1, response.output.shape[-1]).float(),
+        targets.reshape(-1),
+    )
+    _assert_close(chunked.output[:, 16:], response.output)
+    torch.testing.assert_close(chunk_loss, reference_loss, rtol=0, atol=0)
+
+    chunk_loss.backward()
+    reference_loss.backward()
+    for name in (
+        "head.weight",
+        "blocks.0.att.receptance.weight",
+        "blocks.0.ffn.key.weight",
+    ):
+        chunk_gradient = dict(chunk_model.named_parameters())[name].grad
+        reference_gradient = dict(response_reference.named_parameters())[name].grad
+        assert chunk_gradient is not None
+        assert torch.count_nonzero(chunk_gradient) > 0
+        _assert_grad_close(chunk_gradient, reference_gradient)

@@ -5,7 +5,6 @@
 import os, sys, math, gc, importlib
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
@@ -13,6 +12,15 @@ from pytorch_lightning.strategies import DeepSpeedStrategy
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+
+from .infctx import (
+    InfctxBoundary,
+    InfctxContractError,
+    InfctxResult,
+    InfctxState,
+    recurrent_chunk_forward,
+    validate_infctx_chunk_ctx,
+)
 
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
@@ -1097,21 +1105,26 @@ class RWKV(pl.LightningModule):
         x = self.ln_out(x)
         return x
 
+    def _forward_training_features(self, idx):
+        if getattr(self.args, "train_type", "standard") == "infctx":
+            return self.forward_infctx_features(
+                idx,
+                chunk_ctx=self.args.chunk_ctx,
+                boundary=InfctxBoundary.RESET,
+            ).output
+        return self._forward_features(idx)
+
     def _infctx_chunk_ctx(self, chunk_ctx=None):
         args = self.args
         if chunk_ctx is None:
             chunk_ctx = getattr(args, "chunk_ctx", 0)
-        chunk_ctx = int(chunk_ctx)
-        if chunk_ctx <= 0:
-            raise ValueError("infctx requires chunk_ctx > 0.")
-        if chunk_ctx >= int(args.ctx_len):
-            raise ValueError("infctx requires chunk_ctx < ctx_len.")
-        chunk_len = int(globals().get("CHUNK_LEN", 16))
-        if chunk_ctx % chunk_len != 0:
-            raise ValueError(f"infctx chunk_ctx must be divisible by RWKV CUDA chunk length {chunk_len}.")
-        return chunk_ctx
+        return validate_infctx_chunk_ctx(
+            chunk_ctx,
+            ctx_len=int(args.ctx_len),
+            kernel_chunk_len=int(globals().get("CHUNK_LEN", 16)),
+        )
 
-    def create_infctx_state(self, batch_size, device, dtype):
+    def reset_infctx_state(self, batch_size, device, dtype):
         args = self.args
         head_size = int(args.head_size)
         n_head = int(args.dim_att) // head_size
@@ -1132,16 +1145,67 @@ class RWKV(pl.LightningModule):
             device=device,
             dtype=torch.float32,
         )
-        return shift_states, wkv_states
+        return InfctxState(
+            shift_states=shift_states,
+            wkv_states=wkv_states,
+            tokens_seen=0,
+        )
 
-    def forward_infctx_chunk(self, idx, shift_states, wkv_states):
+    def _validate_infctx_state(self, state, *, batch_size, device, dtype):
+        if not isinstance(state, InfctxState):
+            raise InfctxContractError("RWKV infctx state must be InfctxState")
+        args = self.args
+        head_size = int(args.head_size)
+        expected_shift_shape = (
+            int(args.n_layer),
+            2,
+            batch_size,
+            int(args.n_embd),
+        )
+        expected_wkv_shape = (
+            int(args.n_layer),
+            batch_size,
+            int(args.dim_att) // head_size,
+            head_size,
+            head_size,
+        )
+        if state.shift_states.shape != expected_shift_shape:
+            raise InfctxContractError(
+                "RWKV infctx shift state does not match model and batch dimensions"
+            )
+        if state.wkv_states.shape != expected_wkv_shape:
+            raise InfctxContractError(
+                "RWKV infctx WKV state does not match model and batch dimensions"
+            )
+        if state.shift_states.device != device or state.wkv_states.device != device:
+            raise InfctxContractError("RWKV infctx state must be on the input device")
+        if state.shift_states.dtype != dtype:
+            raise InfctxContractError(
+                "RWKV infctx shift state dtype must match hidden states"
+            )
+        if state.wkv_states.dtype != torch.float32:
+            raise InfctxContractError("RWKV infctx WKV state must use FP32")
+        if not state.shift_states.is_contiguous() or not state.wkv_states.is_contiguous():
+            raise InfctxContractError("RWKV infctx state must be contiguous")
+
+    def forward_infctx_chunk(self, idx, state):
         args = self.args
         B, T = idx.size()
         chunk_len = int(globals().get("CHUNK_LEN", 16))
-        assert T % chunk_len == 0, "infctx chunk length must be padded to RWKV CUDA chunk length."
-        assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
+        if T <= 0 or T % chunk_len != 0:
+            raise InfctxContractError(
+                "RWKV infctx backend chunk length must be positive and kernel-aligned"
+            )
+        if T > args.ctx_len:
+            raise InfctxContractError("RWKV infctx chunk exceeds model ctx_len")
 
         x = self.emb(idx)
+        self._validate_infctx_state(
+            state,
+            batch_size=B,
+            device=x.device,
+            dtype=x.dtype,
+        )
         v_first = torch.empty_like(x)
         new_tmix_shift_states = []
         new_cmix_shift_states = []
@@ -1152,9 +1216,9 @@ class RWKV(pl.LightningModule):
                     block.forward_infctx,
                     x,
                     v_first,
-                    shift_states[layer_id, 0],
-                    wkv_states[layer_id],
-                    shift_states[layer_id, 1],
+                    state.shift_states[layer_id, 0],
+                    state.wkv_states[layer_id],
+                    state.shift_states[layer_id, 1],
                 )
                 if str(args.strategy).lower() == "fsdp2":
                     (
@@ -1176,9 +1240,9 @@ class RWKV(pl.LightningModule):
                 x, v_first, new_tmix_shift_state, new_wkv_state, new_cmix_shift_state = block.forward_infctx(
                     x,
                     v_first,
-                    shift_states[layer_id, 0],
-                    wkv_states[layer_id],
-                    shift_states[layer_id, 1],
+                    state.shift_states[layer_id, 0],
+                    state.wkv_states[layer_id],
+                    state.shift_states[layer_id, 1],
                 )
             new_tmix_shift_states.append(new_tmix_shift_state)
             new_cmix_shift_states.append(new_cmix_shift_state)
@@ -1192,36 +1256,59 @@ class RWKV(pl.LightningModule):
             ],
             dim=0,
         )
-        return x, new_shift_states, torch.stack(new_wkv_states, dim=0)
+        return InfctxResult(
+            output=x,
+            state=InfctxState(
+                shift_states=new_shift_states,
+                wkv_states=torch.stack(new_wkv_states, dim=0),
+                tokens_seen=state.tokens_seen + T,
+            ),
+        )
 
-    def forward_infctx_features(self, idx, *, chunk_ctx=None, detach_state_between_chunks=False):
+    def forward_infctx_features(
+        self,
+        idx,
+        *,
+        chunk_ctx=None,
+        boundary,
+        state=None,
+    ):
         args = self.args
-        B, T = idx.size()
-        assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
+        B = idx.shape[0]
         chunk_ctx = self._infctx_chunk_ctx(chunk_ctx)
-        chunk_len = int(globals().get("CHUNK_LEN", 16))
-        shift_states, wkv_states = self.create_infctx_state(B, idx.device, self.emb.weight.dtype)
-        chunks = []
-        for start in range(0, T, chunk_ctx):
-            idx_chunk = idx[:, start : start + chunk_ctx]
-            valid_T = idx_chunk.size(1)
-            pad_len = (-valid_T) % chunk_len
-            if pad_len:
-                idx_chunk = F.pad(idx_chunk, (0, pad_len), value=0)
-            hidden, shift_states, wkv_states = self.forward_infctx_chunk(idx_chunk, shift_states, wkv_states)
-            chunks.append(hidden[:, :valid_T])
-            if detach_state_between_chunks:
-                shift_states = shift_states.detach()
-                wkv_states = wkv_states.detach()
-        return torch.cat(chunks, dim=1)
-
-    def forward_infctx_sequence(self, idx, *, chunk_ctx=None, detach_state_between_chunks=False):
-        hidden = self.forward_infctx_features(
+        return recurrent_chunk_forward(
             idx,
             chunk_ctx=chunk_ctx,
-            detach_state_between_chunks=detach_state_between_chunks,
+            ctx_len=int(args.ctx_len),
+            kernel_chunk_len=int(globals().get("CHUNK_LEN", 16)),
+            boundary=boundary,
+            state=state,
+            reset_state=lambda: self.reset_infctx_state(
+                B,
+                idx.device,
+                self.emb.weight.dtype,
+            ),
+            forward_chunk=self.forward_infctx_chunk,
         )
-        return self.head(hidden)
+
+    def forward_infctx_sequence(
+        self,
+        idx,
+        *,
+        chunk_ctx=None,
+        boundary,
+        state=None,
+    ):
+        features = self.forward_infctx_features(
+            idx,
+            chunk_ctx=chunk_ctx,
+            boundary=boundary,
+            state=state,
+        )
+        return InfctxResult(
+            output=self.head(features.output),
+            state=features.state,
+        )
 
     if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0: # saves 70~80% VRAM
 
@@ -1230,7 +1317,7 @@ class RWKV(pl.LightningModule):
 
         def training_step(self, batch, batch_idx):
             idx, targets = batch
-            hidden = self(idx)
+            hidden = self._forward_training_features(idx)
             return head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
 
     else:
@@ -1242,7 +1329,7 @@ class RWKV(pl.LightningModule):
 
         def training_step(self, batch, batch_idx):
             idx, targets = batch
-            logits = self(idx)
+            logits = self.head(self._forward_training_features(idx))
 
             ############################################################
             # slow pytorch version (!!! SLOW AND TAKES 40% MORE VRAM !!!)

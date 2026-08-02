@@ -31,6 +31,12 @@ def main() -> None:
     parser.add_argument("--vocab_size", default=0, type=int)  # vocab_size = 0 means auto (for char-level LM and .txt data)
 
     parser.add_argument("--ctx_len", default=1024, type=int)
+    parser.add_argument(
+        "--train_type",
+        choices=("standard", "infctx"),
+        default="standard",
+    )
+    parser.add_argument("--chunk_ctx", default=0, type=int)
     parser.add_argument("--epoch_steps", default=1000, type=int)  # a mini "epoch" has [epoch_steps] steps
     parser.add_argument("--epoch_count", default=500, type=int)  # train for this many "epochs". will continue afterwards with lr = lr_final
     parser.add_argument("--epoch_begin", default=0, type=int)  # if you load a model trained for x "epochs", set epoch_begin = x
@@ -73,6 +79,7 @@ def main() -> None:
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
+    from .infctx import InfctxContractError, validate_infctx_chunk_ctx
     if "deepspeed" in args.strategy:
         import deepspeed
     from pytorch_lightning import seed_everything
@@ -97,11 +104,22 @@ def main() -> None:
     args.max_epochs = -1  # continue forever
     args.betas = (args.beta1, args.beta2)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
+    if args.train_type == "infctx":
+        validate_infctx_chunk_ctx(args.chunk_ctx, ctx_len=args.ctx_len)
+        if args.ctx_len % 16 != 0:
+            raise InfctxContractError(
+                "infctx ctx_len must be divisible by the backend kernel chunk length"
+            )
+    elif args.chunk_ctx != 0:
+        raise InfctxContractError(
+            "chunk_ctx is only valid when train_type is infctx"
+        )
     os.environ["RWKV_MY_TESTING"] = args.my_testing
     os.environ["RWKV_KERNEL"] = args.kernel
     os.environ["RWKV_CTXLEN"] = str(args.ctx_len)
     os.environ["RWKV_HEAD_SIZE"] = str(args.head_size)
     os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = str(args.head_chunk)
+    os.environ["RWKV_TRAIN_TYPE"] = args.train_type
     if args.dim_att <= 0:
         args.dim_att = args.n_embd
     if args.dim_ffn <= 0:
