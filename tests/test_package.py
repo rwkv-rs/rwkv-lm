@@ -1,7 +1,4 @@
-import importlib.resources
 import json
-import multiprocessing
-import pickle
 import shutil
 import subprocess
 import sys
@@ -9,26 +6,14 @@ import venv
 import zipfile
 from pathlib import Path
 
-import rwkv_lm
-from rwkv_lm.cuda_sources import cuda_sources
-
-
-def _inspect_import(queue) -> None:
-    import rwkv_lm.cuda_sources
-
-    function = rwkv_lm.cuda_sources.cuda_sources
-    queue.put((rwkv_lm.cuda_sources.__name__, function.__module__))
-
 
 def test_package_import_is_cwd_independent_and_does_not_import_torch(tmp_path):
     code = """
 import json
 import sys
 import rwkv_lm
-from rwkv_lm.cuda_sources import cuda_sources
 print(json.dumps({
     "package": rwkv_lm.__name__,
-    "function_module": cuda_sources.__module__,
     "torch_loaded": "torch" in sys.modules,
 }))
 """
@@ -41,46 +26,11 @@ print(json.dumps({
     )
     assert json.loads(result.stdout) == {
         "package": "rwkv_lm",
-        "function_module": "rwkv_lm.cuda_sources",
         "torch_loaded": False,
     }
 
 
-def test_import_identity_survives_pickle_and_spawn():
-    restored = pickle.loads(pickle.dumps(cuda_sources))
-    assert restored is cuda_sources
-    assert restored.__module__ == "rwkv_lm.cuda_sources"
-
-    context = multiprocessing.get_context("spawn")
-    queue = context.Queue()
-    process = context.Process(target=_inspect_import, args=(queue,))
-    process.start()
-    process.join(timeout=30)
-
-    assert process.exitcode == 0
-    assert queue.get(timeout=5) == (
-        "rwkv_lm.cuda_sources",
-        "rwkv_lm.cuda_sources",
-    )
-
-
-def test_cuda_sources_are_package_resources():
-    cuda_dir = importlib.resources.files(rwkv_lm).joinpath("cuda")
-    packaged_sources = {
-        resource.name
-        for resource in cuda_dir.iterdir()
-        if resource.name.endswith((".cpp", ".cu"))
-    }
-    resolved_sources = {
-        Path(source).name
-        for source in cuda_sources(*sorted(packaged_sources))
-    }
-
-    assert packaged_sources
-    assert resolved_sources == packaged_sources
-
-
-def test_wheel_contains_package_and_cuda_assets(tmp_path):
+def test_wheel_contains_standard_training_surface_without_native_runtime(tmp_path):
     project_root = Path(__file__).resolve().parents[1]
     build_root = tmp_path / "project"
     shutil.copytree(project_root / "src", build_root / "src")
@@ -104,19 +54,25 @@ setuptools.build_meta.build_wheel({str(wheel_dir)!r})
     (wheel_path,) = wheel_dir.glob("rwkv_lm-*.whl")
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
-    source_names = {
-        path.name
-        for path in (project_root / "src" / "rwkv_lm" / "cuda").iterdir()
-    }
-    wheel_sources = {
-        Path(name).name
-        for name in names
-        if name.startswith("rwkv_lm/cuda/")
-    }
+        entry_points_name = next(
+            name for name in names if name.endswith(".dist-info/entry_points.txt")
+        )
+        entry_points = wheel.read(entry_points_name).decode("utf-8")
 
     assert "rwkv_lm/__init__.py" in names
-    assert wheel_sources == source_names
+    assert "rwkv_lm/standard_model.py" in names
+    assert "rwkv_lm/fsdp2_trainer.py" in names
+    assert "rwkv_lm/infctx.py" in names
+    assert "rwkv_lm/peft.py" in names
+    assert "rwkv_lm/model.py" not in names
+    assert "rwkv_lm/cuda_sources.py" not in names
+    assert not any(name.startswith("rwkv_lm/cuda/") for name in names)
     assert not any(name.startswith("src/") for name in names)
+    assert "rwkv-train = rwkv_lm.cli:main" in entry_points
+    assert (
+        "rwkv-convert-legacy-checkpoint = rwkv_lm.standard_model:converter_main"
+        in entry_points
+    )
 
     environment = tmp_path / "venv"
     venv.EnvBuilder(with_pip=True).create(environment)
@@ -132,10 +88,8 @@ setuptools.build_meta.build_wheel({str(wheel_dir)!r})
             python,
             "-c",
             (
-                "from pathlib import Path; import rwkv_lm; "
-                "from rwkv_lm.cuda_sources import cuda_sources; "
-                "assert Path(cuda_sources('wkv7_op.cpp')[0]).is_file(); "
-                "print(rwkv_lm.__name__)"
+                "import sys; import rwkv_lm; import rwkv_lm.cli; "
+                "assert 'torch' not in sys.modules; print(rwkv_lm.__name__)"
             ),
         ],
         cwd=tmp_path,

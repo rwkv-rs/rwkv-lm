@@ -1,113 +1,69 @@
-## HOW TO TRAIN RWKV-7 on MiniPile (1.5G tokens) ##
+# rwkv-lm
 
-For reference, use python 3.10+, torch 2.5+, cuda 12.5+, latest deepspeed, but **keep pytorch-lightning==1.9.5**
+This package trains the standard `transformers-rwkv` RWKV-7 causal language
+model with composable PyTorch FSDP2. Model layers and recurrent state are owned
+by `transformers-rwkv`; accelerated WKV dispatch is owned by the public
+`fla-rwkv` / `FlashRWKV` provider interface. The package does not build or ship
+a second RWKV model or private CUDA kernels.
 
-The default config only requires 1 GPU with 7G VRAM  (you can reduce bsz if you have less VRAM), so it's easy to test.
+The training environment must provide compatible builds of those three model
+and backend projects in addition to this package. An explicit
+`--wkv_backend flash_rwkv` request fails closed if that provider cannot accept
+the real training tensors. `--wkv_backend reference` selects the differentiable
+Transformers reference recurrence.
 
-To upgrade your existing code, use these kernels (note: the code might be newer than this) for much faster training:
-```
-rwkv7_clampw_v3 (try rwkv7_clampw_v3_for_h100 and rwkv7_clampw_v3_for_h100_alt too)
-rwkv7_cmix_bf16_v5
-rwkv7_tmix_mix6_bf16_v5
-rwkv7_tmix_kk_pre_bf16_v5
-rwkv7_tmix_lnx_rkvres_xg_bf16_v1
-rwkv7_tmix_a_gate_bf16
-rwkv7_tmix_vres_gate_bf16_v1
-rwkv7_l2wrap_ce_bf16_v2
-```
+## Convert an existing checkpoint once
 
-**Train RWKV-7:**
-```
-# enter the installable RWKV-7 training project
-cd RWKV-v7/train_temp/
+Raw RWKV `.pth` files are migration inputs, not training checkpoints. Convert
+one to a standard model directory before training:
 
-# you can use latest torch + latest cuda (not limited to cu121)
-pip install torch --upgrade --extra-index-url https://download.pytorch.org/whl/cu121
-pip install -e .
-
-# train RWKV-7
-# download minipile .bin .idx to train_temp/data first (download link in demo-training-prepare.sh)
-
-# this will generate the initial weight rwkv-init.pth in out/....../
-sh ./demo-training-prepare.sh
-
-# this will load rwkv-init.pth and train the model. you may want to log in to wandb first
-sh ./demo-training-run.sh
-
-your out/....../train_log.txt should have losses similar to (must be within +-0.01 or something is wrong):
-0 4.875856 131.0863 0.00059975 2025-04-24 02:23:42.481256 0
-1 4.028621 56.1834 0.00059899 2025-04-24 02:28:16.674463 1
-2 3.801625 44.7739 0.00059773 2025-04-24 02:32:51.059568 2
-3 3.663070 38.9808 0.00059597 2025-04-24 02:37:25.409892 3
-4 3.578974 35.8368 0.00059371 2025-04-24 02:41:59.711315 4
-5 3.510906 33.4786 0.00059096 2025-04-24 02:46:33.990839 5
-6 3.462345 31.8917 0.00058771 2025-04-24 02:51:08.378331 6
-7 3.412196 30.3318 0.00058399 2025-04-24 02:55:42.927474 7
-8 3.376724 29.2747 0.00057978 2025-04-24 03:00:17.504665 8
-9 3.336911 28.1321 0.00057511 2025-04-24 03:04:52.006063 9
-10 3.313411 27.4787 0.00056999 2025-04-24 03:09:27.563336 10
-11 3.295895 27.0016 0.00056441 2025-04-24 03:14:01.786079 11
+```bash
+rwkv-convert-legacy-checkpoint legacy-model.pth out/rwkv-init \
+  --wkv-backend flash_rwkv
 ```
 
-RWKV-7 is the whole model with carefully set stuffs, including different init / wd / lr for each parameter, so it's readily scalable and very stable (spike-free).
+`rwkv-train` intentionally refuses raw `.pth` input. The converter remains the
+only legacy model entry point; subsequent save, load, resume, merge, and
+inference use standard model directories or complete FSDP2 checkpoints.
 
-But the price to pay is there is no good simple "RWKV-7 layer" because a pytorch layer can't make sure itself is using correct init and hyperparameters.
+## Train
 
-So if you need to use RWKV-7 for another task, please study train_temp code (only several hundred lines) and change it to suit you.
+`demo-training-run.sh` and `demo-training-run-v7-pile.sh` contain complete
+single-node examples. They require a standard model directory at the configured
+`PROJ_DIR/rwkv-init` path and launch the canonical entry point with `torchrun`:
 
-See: https://github.com/YS-Tang/RWKV-FLA-comparison
+```bash
+torchrun --standalone --nproc-per-node=8 train.py \
+  --load_model out/rwkv-init \
+  --strategy fsdp2 --accelerator gpu --devices 8 --precision bf16 \
+  --wkv_backend flash_rwkv \
+  --data_type binidx --data_file /path/to/dataset \
+  --proj_dir out/run --ctx_len 4096 --n_layer 24 --n_embd 2048 \
+  --head_size 64 --vocab_size 65536 --micro_bsz 1 \
+  --magic_prime 40320
+```
 
-<img width="3318" height="2475" alt="image" src="https://github.com/user-attachments/assets/d9f019c2-a178-4837-8539-3a360c0e6801" />
+The FSDP2 checkpoint transaction includes model, optimizer, mixed-precision
+scaler, scheduler position, RNG, and data cursor state. Resuming from its
+directory restores those states together.
 
-<img width="2656" height="1956" alt="image" src="https://github.com/user-attachments/assets/871d358b-dcd4-4b86-a04b-45c1bcc910b7" />
+## PEFT and infctx
 
-RWKV-7 weight example for 1.5B (L24-D2048, vocab 65536):
+LoRA is attached to public Transformers projections. For example:
 
-**Make sure you only apply wd to large tensors (with "wdecay" in comment) here**, or the performance will be much worse.
+```text
+--lora_rank 8 --lora_alpha 16 \
+--lora_target_modules time_mix.output,channel_mix.value
+```
 
-| name                | shape         | comment      | initialization  |
-|---------------------|---------------|--------------|-----------------|
-| emb.weight          | [65536, 2048] | wdecay       | see code        |
-| blocks.0.ln0.weight | [2048]        | for layer 0  | 1               |
-| blocks.0.ln0.bias   | [2048]        | for layer 0  | 0               |
-|                     |               |              |                 |
-| blocks.*.ln1.weight | [2048]        |              | 1               |
-| blocks.*.ln1.bias   | [2048]        |              | 0               |
-| blocks.*.att.x_r    | [1, 1, 2048]  |              | see code        |
-| blocks.*.att.x_w    | [1, 1, 2048]  |              | see code        |
-| blocks.*.att.x_k    | [1, 1, 2048]  |              | see code        |
-| blocks.*.att.x_v    | [1, 1, 2048]  |              | see code        |
-| blocks.*.att.x_a    | [1, 1, 2048]  |              | see code        |
-| blocks.*.att.x_g    | [1, 1, 2048]  |              | see code        |
-| blocks.*.att.w0     | [1, 1, 2048]  | lr 2x        | see code        |
-| blocks.*.att.w1     | [2048, 96]    |              | 0               |
-| blocks.*.att.w2     | [96, 2048]    |              | see code        |
-| blocks.*.att.a0     | [1, 1, 2048]  |              | 0               |
-| blocks.*.att.a1     | [2048, 96]    |              | 0               |
-| blocks.*.att.a2     | [96, 2048]    |              | see code        |
-| blocks.*.att.v0     | [1, 1, 2048]  | for layer 1+ | 1               |
-| blocks.*.att.v1                | [2048, 64]   | for layer 1+ | 0         |
-| blocks.*.att.v2                | [64, 2048]   | for layer 1+ | see code  |
-| blocks.*.att.g1                | [2048, 256]  |              | 0         |
-| blocks.*.att.g2                | [256, 2048]  |              | see code  |
-| blocks.*.att.k_k               | [1, 1, 2048] |              | 1         |
-| blocks.*.att.k_a               | [1, 1, 2048] |              | 1         |
-| blocks.*.att.r_k               | [32, 64]     |              | 0         |
-| blocks.*.att.receptance.weight | [2048, 2048] | wdecay       | see code  |
-| blocks.*.att.key.weight        | [2048, 2048] | wdecay       | see code  |
-| blocks.*.att.value.weight      | [2048, 2048] | wdecay       | see code  |
-| blocks.*.att.output.weight     | [2048, 2048] | wdecay       | 0         |
-| blocks.*.att.ln_x.weight       | [2048]       |              | see code  |
-| blocks.*.att.ln_x.bias         | [2048]       |              | 0         |
-|                                |              |              |           |
-| blocks.*.ln2.weight            | [2048]       |              | 1         |
-| blocks.*.ln2.bias              | [2048]       |              | 0         |
-| blocks.*.ffn.x_k               | [1, 1, 2048] |              | see code  |
-| blocks.*.ffn.key.weight        | [8192, 2048] | wdecay       | see code  |
-| blocks.*.ffn.value.weight      | [2048, 8192] | wdecay       | 0         |
-|                                |              |              |           |
-| ln_out.weight | [2048]        |        | 1         |
-| ln_out.bias   | [2048]        |        | 0         |
-| head.weight   | [65536, 2048] | wdecay | see code  |
+Adapter-only save/load, checkpoint resume, merged standard model export, and
+inference are handled by the same standard adapter. Recurrent chunk training is
+selected with:
 
-**Simplified RWKV-7 training demo (slow & different results)**: https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/train_temp/rwkv7_train_simplified.py
+```text
+--train_type infctx --chunk_ctx 16
+```
+
+The infctx path passes the public Transformers recurrent state between chunks,
+detaches it at TBPTT boundaries, preserves response-token gradients, and resets
+state only at an explicit reset boundary.

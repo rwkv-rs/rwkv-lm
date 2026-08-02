@@ -21,17 +21,17 @@ from rwkv_lm.dataset import MyDataset
 from rwkv_lm.trainer import scheduled_learning_rate
 
 
-def _backend(*, version: str = "1.9.5") -> BackendIdentity:
+def _backend(*, version: str = torch.__version__) -> BackendIdentity:
     return BackendIdentity(
-        name="pytorch-lightning",
+        name="pytorch",
         version=version,
-        strategy="single_device",
+        strategy="single_process",
         world_size=1,
         state_dict_type="full",
     )
 
 
-def _adapter(*, version: str = "1.9.5") -> EpochCheckpointRunnerAdapter:
+def _adapter(*, version: str = torch.__version__) -> EpochCheckpointRunnerAdapter:
     return EpochCheckpointRunnerAdapter(
         backend=_backend(version=version),
         training_config={
@@ -392,8 +392,7 @@ def test_fp16_gradient_scaler_state_round_trips(tmp_path: Path) -> None:
     )
 
     assert (
-        manifest.states["gradient_scaler"].serialization
-        == "torch-grad-scaler-json-v1"
+        manifest.states["gradient_scaler"].serialization == "torch-grad-scaler-json-v1"
     )
     assert resumed_gradient_scaler.state_dict() == expected_scaler_state
 
@@ -416,7 +415,7 @@ def test_restore_rejects_backend_or_config_drift_before_model_mutation(
     candidate, candidate_optimizer = _new_runner()
     before = {name: tensor.clone() for name, tensor in candidate.state_dict().items()}
     with pytest.raises(CheckpointContractError, match="backend identity"):
-        _adapter(version="1.9.6").restore(
+        _adapter(version="incompatible-version").restore(
             checkpoint,
             model=candidate,
             optimizer=candidate_optimizer,

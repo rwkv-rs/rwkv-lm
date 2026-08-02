@@ -1,11 +1,11 @@
 #!/bin/bash
 #######################################################################################################################
 #
-# Run demo-training-prepare.sh with the same MODEL_TYPE & N_LAYER & N_EMBD first
-# Or, rename your base model to rwkv-init.pth and put it in the output folder
+# Convert a legacy .pth once with rwkv-convert-legacy-checkpoint, or use an
+# existing standard transformers-rwkv model directory at PROJ_DIR/rwkv-init.
 #
 # The trainer resumes from the newest verified checkpoints/epoch-* directory.
-# If none exists, rwkv-init.pth is accepted only as a model initialization input.
+# PROJ_DIR/rwkv-init must be a standard model directory, never a raw .pth file.
 # FSDP2 writes one verified sharded checkpoint transaction across all ranks.
 #
 #######################################################################################################################

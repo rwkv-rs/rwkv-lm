@@ -91,14 +91,23 @@ _TREE_STATE_SERIALIZATIONS = frozenset(
         "torch-rng-state-per-rank-v1",
     }
 )
-SUPPORTED_STANDARD_PROFILES = frozenset(
+_CURRENT_STANDARD_PROFILES = frozenset(
     {
-        ("deepspeed", "deepspeed_stage_2", "full"),
         ("pytorch", "fsdp2", "sharded"),
         ("pytorch", "single_process", "full"),
+    }
+)
+# Read-only manifest compatibility for checkpoints produced before the FSDP2
+# migration. No current runner imports or writes either legacy backend.
+_LEGACY_STANDARD_PROFILES = frozenset(
+    {
+        ("deepspeed", "deepspeed_stage_2", "full"),
         ("pytorch-lightning", "ddp", "full"),
         ("pytorch-lightning", "single_device", "full"),
     }
+)
+SUPPORTED_STANDARD_PROFILES = frozenset(
+    _CURRENT_STANDARD_PROFILES | _LEGACY_STANDARD_PROFILES
 )
 
 

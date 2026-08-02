@@ -27,7 +27,6 @@ from .checkpoint import (
 
 _RUNNER_BACKEND_PROFILES = {
     ("pytorch", "single_process", "full"),
-    ("pytorch-lightning", "single_device", "full"),
 }
 _RNG_SCHEMA_VERSION = 1
 _STATE_PATHS = {
@@ -53,12 +52,11 @@ class Stateful(Protocol):
 
 @dataclass(frozen=True)
 class EpochCheckpointRunnerAdapter:
-    """Save and restore the current callback scheduler at epoch boundaries.
+    """Save and restore a single-process PyTorch checkpoint transaction.
 
-    The v1 adapter intentionally supports only single-process PyTorch and
-    Lightning backends. DDP and DeepSpeed need per-rank RNG and backend-owned
-    optimizer collection; treating rank-zero ``state_dict()`` output as
-    complete would make the manifest dishonest.
+    Distributed training is owned by the FSDP2 adapter. Legacy backend names
+    remain readable at the manifest boundary, but this writer never creates
+    Lightning or DeepSpeed training state.
     """
 
     backend: BackendIdentity
@@ -230,9 +228,7 @@ class EpochCheckpointRunnerAdapter:
             (checkpoint_dir / manifest.states["scheduler"].path).read_bytes()
         )
         gradient_scaler_payload = json.loads(
-            (
-                checkpoint_dir / manifest.states["gradient_scaler"].path
-            ).read_bytes()
+            (checkpoint_dir / manifest.states["gradient_scaler"].path).read_bytes()
         )
         data_cursor = json.loads(
             (checkpoint_dir / manifest.states["data_cursor"].path).read_bytes()
@@ -315,8 +311,7 @@ def _require_runner_backend(backend: BackendIdentity) -> None:
     if profile not in _RUNNER_BACKEND_PROFILES or backend.world_size != 1:
         raise CheckpointContractError(
             "standard runner checkpoint adapter only supports "
-            "pytorch/single_process/full or "
-            "pytorch-lightning/single_device/full with world_size=1; "
+            "pytorch/single_process/full with world_size=1; "
             f"got {'/'.join(profile)} world_size={backend.world_size}"
         )
 
@@ -373,19 +368,13 @@ def _gradient_scaler_payload(
         return {"enabled": False, "state_dict": {}}
     is_enabled = getattr(gradient_scaler, "is_enabled", None)
     if not callable(is_enabled):
-        raise CheckpointContractError(
-            "gradient scaler must provide is_enabled()"
-        )
+        raise CheckpointContractError("gradient scaler must provide is_enabled()")
     enabled = is_enabled()
     if not isinstance(enabled, bool):
-        raise CheckpointContractError(
-            "gradient scaler is_enabled() must return bool"
-        )
+        raise CheckpointContractError("gradient scaler is_enabled() must return bool")
     state_dict = gradient_scaler.state_dict()
     if not isinstance(state_dict, Mapping):
-        raise CheckpointContractError(
-            "gradient scaler state_dict must be a mapping"
-        )
+        raise CheckpointContractError("gradient scaler state_dict must be a mapping")
     return {
         "enabled": enabled,
         "state_dict": dict(state_dict),
@@ -410,9 +399,7 @@ def _validate_gradient_scaler_restore(
     if gradient_scaler is not None:
         is_enabled = getattr(gradient_scaler, "is_enabled", None)
         if not callable(is_enabled):
-            raise CheckpointContractError(
-                "gradient scaler must provide is_enabled()"
-            )
+            raise CheckpointContractError("gradient scaler must provide is_enabled()")
         runtime_enabled = is_enabled()
         if not isinstance(runtime_enabled, bool):
             raise CheckpointContractError(
