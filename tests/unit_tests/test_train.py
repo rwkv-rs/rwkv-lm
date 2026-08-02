@@ -34,6 +34,8 @@ def test_run_train_uses_torchtitan_module_and_config_contract(tmp_path) -> None:
         }
     )
     environment.pop("COMM_MODE", None)
+    environment.pop("MODULE", None)
+    environment.pop("CONFIG", None)
 
     subprocess.run(
         [
