@@ -12,10 +12,10 @@ from packaging.requirements import Requirement
 
 _STANDARD_RUNTIME_DIRECT_REQUIREMENTS = {
     "flash-linear-attention": (
-        frozenset({"cuda"}),
+        frozenset({"cuda", "flash-rwkv"}),
         (
             "git+https://github.com/rwkv-rs/fla-rwkv.git@"
-            "1bc262c8c81241e1d339419a31f0aadffa20c210"
+            "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
         ),
     ),
     "flash-rwkv": (
@@ -29,7 +29,7 @@ _STANDARD_RUNTIME_DIRECT_REQUIREMENTS = {
         frozenset(),
         (
             "git+https://github.com/rwkv-rs/transformers-rwkv.git@"
-            "eb8248eb9083288e7769518077a1be9c0f7cf7b8"
+            "2696927df9363b5fa175076bb827ba4da2c4e581"
         ),
     ),
 }

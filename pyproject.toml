@@ -9,11 +9,11 @@ description = "RWKV language-model training components"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "flash-linear-attention[cuda] @ git+https://github.com/rwkv-rs/fla-rwkv.git@1bc262c8c81241e1d339419a31f0aadffa20c210",
+    "flash-linear-attention[cuda,flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@a4a8aa98df6ec5322f194a80ec57363dd045adfc",
     "flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@866aafd2eed146b0eda1ce03444009ae030f89e3",
     "numpy>=2.0.0",
     "torch",
-    "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@eb8248eb9083288e7769518077a1be9c0f7cf7b8",
+    "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@2696927df9363b5fa175076bb827ba4da2c4e581",
     "wandb",
 ]
 

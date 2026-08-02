@@ -74,6 +74,61 @@ def test_fla_rwkv7_public_api_exposes_stateful_dispatch_and_telemetry() -> None:
     assert not inspect.signature(get_last_provider).parameters
 
 
+def test_transformers_rwkv7_public_provenance_contract_matches_manifest() -> None:
+    modeling = pytest.importorskip("transformers.models.rwkv7.modeling_rwkv7")
+    validate_provenance = getattr(
+        modeling,
+        "validate_rwkv7_runtime_provenance",
+        None,
+    )
+
+    assert callable(validate_provenance)
+    assert not inspect.signature(validate_provenance).parameters
+    assert modeling.RWKV7_FLA_EXTRA == "flash-rwkv"
+    assert modeling.RWKV7_FLA_REPOSITORY == "https://github.com/rwkv-rs/fla-rwkv.git"
+    assert modeling.RWKV7_FLA_REVISION == "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
+    assert modeling.RWKV7_FLA_REQUIREMENT == (
+        "flash-linear-attention[flash-rwkv] @ "
+        "git+https://github.com/rwkv-rs/fla-rwkv.git@"
+        "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
+    )
+    assert (
+        modeling.RWKV7_FLASH_RWKV_REPOSITORY
+        == "https://github.com/rwkv-rs/FlashRWKV.git"
+    )
+    assert (
+        modeling.RWKV7_FLASH_RWKV_REVISION
+        == "866aafd2eed146b0eda1ce03444009ae030f89e3"
+    )
+
+
+def test_transformers_rwkv7_public_provenance_matches_installed_runtime() -> None:
+    modeling = pytest.importorskip("transformers.models.rwkv7.modeling_rwkv7")
+    validate_provenance = getattr(
+        modeling,
+        "validate_rwkv7_runtime_provenance",
+        None,
+    )
+
+    assert callable(validate_provenance)
+    provenance = validate_provenance()
+    assert provenance["distribution"] == "flash-linear-attention"
+    assert provenance["extra"] == "flash-rwkv"
+    assert provenance["repository"] == "https://github.com/rwkv-rs/fla-rwkv.git"
+    assert provenance["revision"] == "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
+    assert provenance["flash_rwkv_distribution"] == "flash-rwkv"
+    assert (
+        provenance["flash_rwkv_repository"]
+        == "https://github.com/rwkv-rs/FlashRWKV.git"
+    )
+    assert (
+        provenance["flash_rwkv_revision"]
+        == "866aafd2eed146b0eda1ce03444009ae030f89e3"
+    )
+    assert provenance["source_kind"] in {"editable", "vcs"}
+    assert provenance["flash_rwkv_source_kind"] in {"editable", "vcs"}
+
+
 def test_standard_training_loss_reaches_public_fla_boundary_without_fallback(
     monkeypatch,
     _isolated_fla_contract,

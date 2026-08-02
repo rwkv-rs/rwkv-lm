@@ -678,8 +678,8 @@ def test_missing_standard_dependency_fails_closed(monkeypatch) -> None:
 
     message = str(error.value)
     assert standard_model._CONFIG_MODULE in message
-    assert "transformers@eb8248eb9083288e7769518077a1be9c0f7cf7b8" in message
-    assert "flash-linear-attention@1bc262c8c81241e1d339419a31f0aadffa20c210" in message
+    assert "transformers@2696927df9363b5fa175076bb827ba4da2c4e581" in message
+    assert "flash-linear-attention@a4a8aa98df6ec5322f194a80ec57363dd045adfc" in message
     assert "flash-rwkv@866aafd2eed146b0eda1ce03444009ae030f89e3" in message
     assert attempted == ["transformers.models.rwkv7.configuration_rwkv7"]
 
