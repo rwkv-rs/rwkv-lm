@@ -28,6 +28,40 @@ _PUBLIC_CHUNK_RWKV7_PARAMETERS = frozenset(
 )
 
 
+def _standard_flash_model():
+    return create_standard_rwkv7_model(
+        SimpleNamespace(
+            ctx_len=16,
+            dim_ffn=224,
+            head_size=64,
+            n_embd=64,
+            n_layer=2,
+            vocab_size=64,
+            wkv_backend="flash_rwkv",
+        )
+    )
+
+
+@pytest.fixture
+def _isolated_fla_contract(monkeypatch):
+    modeling = pytest.importorskip("transformers.models.rwkv7.modeling_rwkv7")
+    validate_provenance = getattr(
+        modeling,
+        "validate_rwkv7_runtime_provenance",
+        None,
+    )
+    if callable(validate_provenance):
+        monkeypatch.setattr(
+            modeling,
+            "validate_rwkv7_runtime_provenance",
+            dict,
+        )
+    contract_loader = modeling._load_fla_rwkv7_contract
+    contract_loader.cache_clear()
+    yield
+    contract_loader.cache_clear()
+
+
 def test_fla_rwkv7_public_api_exposes_stateful_dispatch_and_telemetry() -> None:
     rwkv7 = pytest.importorskip("fla.ops.rwkv7")
     chunk_rwkv7 = getattr(rwkv7, "chunk_rwkv7", None)
@@ -42,22 +76,13 @@ def test_fla_rwkv7_public_api_exposes_stateful_dispatch_and_telemetry() -> None:
 
 def test_standard_training_loss_reaches_public_fla_boundary_without_fallback(
     monkeypatch,
+    _isolated_fla_contract,
 ) -> None:
     rwkv7 = pytest.importorskip("fla.ops.rwkv7")
     pytest.importorskip("transformers.models.rwkv7")
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
 
-    model = create_standard_rwkv7_model(
-        SimpleNamespace(
-            ctx_len=16,
-            dim_ffn=224,
-            head_size=64,
-            n_embd=64,
-            n_layer=2,
-            vocab_size=64,
-            wkv_backend="flash_rwkv",
-        )
-    )
+    model = _standard_flash_model()
     input_ids = torch.arange(16).reshape(1, 16)
 
     with pytest.raises(
@@ -70,3 +95,42 @@ def test_standard_training_loss_reaches_public_fla_boundary_without_fallback(
         standard_rwkv7_training_loss(model, input_ids, input_ids)
 
     assert rwkv7.get_last_rwkv7_provider() is None
+
+
+def test_standard_training_rejects_non_flash_fla_provider(
+    monkeypatch,
+    _isolated_fla_contract,
+) -> None:
+    rwkv7 = pytest.importorskip("fla.ops.rwkv7")
+    monkeypatch.setenv("FLA_FLASH_RWKV", "1")
+
+    def non_flash_chunk(
+        r,
+        w,
+        k,
+        v,
+        a,
+        b,
+        *,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        state_indices,
+        mode,
+    ):
+        del r, w, k, a, b, output_final_state, cu_seqlens, state_indices, mode
+        return v, initial_state
+
+    monkeypatch.setattr(rwkv7, "chunk_rwkv7", non_flash_chunk)
+    monkeypatch.setattr(rwkv7, "get_last_rwkv7_provider", lambda: "triton")
+    model = _standard_flash_model()
+    input_ids = torch.arange(16).reshape(1, 16)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Explicit FlashRWKV request failed closed: "
+            "FLA public chunk_rwkv7 did not select FlashRWKV; fallback is disabled"
+        ),
+    ):
+        standard_rwkv7_training_loss(model, input_ids, input_ids)

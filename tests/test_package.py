@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,11 @@ _STANDARD_RUNTIME_DIRECT_REQUIREMENTS = {
         ),
     ),
 }
+_STANDARD_RUNTIME_OWNED_SOURCES = {
+    "flash-linear-attention": "git+https://github.com/rwkv-rs/fla-rwkv.git@",
+    "flash-rwkv": "git+https://github.com/rwkv-rs/FlashRWKV.git@",
+    "transformers": "git+https://github.com/rwkv-rs/transformers-rwkv.git@",
+}
 
 
 def test_standard_runtime_dependencies_use_exact_direct_revisions() -> None:
@@ -51,6 +57,23 @@ def test_standard_runtime_dependencies_use_exact_direct_revisions() -> None:
         assert requirement.url == url
         assert not requirement.specifier
         assert requirement.marker is None
+
+
+def test_standard_runtime_dependencies_reject_upstream_fallback_sources() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
+    direct_requirements = {
+        requirement.name: requirement
+        for value in metadata["project"]["dependencies"]
+        if (requirement := Requirement(value)).url is not None
+    }
+
+    assert direct_requirements.keys() == _STANDARD_RUNTIME_OWNED_SOURCES.keys()
+    for package, source in _STANDARD_RUNTIME_OWNED_SOURCES.items():
+        url = direct_requirements[package].url
+        assert url is not None
+        assert url.startswith(source)
+        assert re.fullmatch(r"[0-9a-f]{40}", url.removeprefix(source))
 
 
 def test_package_import_is_cwd_independent_and_does_not_import_torch(tmp_path):
