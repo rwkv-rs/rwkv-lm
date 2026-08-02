@@ -226,6 +226,13 @@ class EpochCheckpointRunnerAdapter:
         scheduler_payload = json.loads(
             (checkpoint_dir / manifest.states["scheduler"].path).read_bytes()
         )
+        data_cursor = json.loads(
+            (checkpoint_dir / manifest.states["data_cursor"].path).read_bytes()
+        )
+        if data_cursor["samples_per_epoch"] != self.samples_per_epoch:
+            raise CheckpointContractError(
+                "checkpoint data cursor samples_per_epoch does not match the runner"
+            )
         if not isinstance(model_state, Mapping):
             raise CheckpointContractError("checkpoint model state must be a mapping")
         if not isinstance(optimizer_state, Mapping):
@@ -349,10 +356,20 @@ def _torch_load(path: Path, owner: str) -> object:
         ) from error
 
 
-def _capture_rng_state() -> dict[str, object]:
+def _capture_rng_state(
+    *,
+    include_cuda: bool = True,
+    cuda_device: int | None = None,
+) -> dict[str, object]:
     python_state = random.getstate()
     numpy_state = np.random.get_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    cuda_states = []
+    if include_cuda and torch.cuda.is_available():
+        cuda_states = (
+            torch.cuda.get_rng_state_all()
+            if cuda_device is None
+            else [torch.cuda.get_rng_state(cuda_device)]
+        )
     return {
         "schema_version": _RNG_SCHEMA_VERSION,
         "python": {
@@ -372,7 +389,11 @@ def _capture_rng_state() -> dict[str, object]:
     }
 
 
-def _validate_rng_state(raw: object) -> dict[str, object]:
+def _validate_rng_state(
+    raw: object,
+    *,
+    expected_cuda_device_count: int | None = None,
+) -> dict[str, object]:
     if not isinstance(raw, dict) or set(raw) != {
         "schema_version",
         "python",
@@ -438,15 +459,22 @@ def _validate_rng_state(raw: object) -> dict[str, object]:
         )
     ):
         raise CheckpointContractError("checkpoint Torch RNG values are invalid")
-    current_cuda_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if len(torch_cuda) != current_cuda_count:
+    if expected_cuda_device_count is None:
+        expected_cuda_device_count = (
+            torch.cuda.device_count() if torch.cuda.is_available() else 0
+        )
+    if len(torch_cuda) != expected_cuda_device_count:
         raise CheckpointContractError(
             "checkpoint CUDA RNG device count does not match the runtime"
         )
     return raw
 
 
-def _restore_rng_state(state: Mapping[str, object]) -> None:
+def _restore_rng_state(
+    state: Mapping[str, object],
+    *,
+    cuda_device: int | None = None,
+) -> None:
     python_state = state["python"]
     numpy_state = state["numpy"]
     random.setstate(
@@ -467,7 +495,14 @@ def _restore_rng_state(state: Mapping[str, object]) -> None:
     )
     torch.set_rng_state(state["torch_cpu"])
     if state["torch_cuda"]:
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        if cuda_device is None:
+            torch.cuda.set_rng_state_all(state["torch_cuda"])
+        else:
+            if len(state["torch_cuda"]) != 1:
+                raise CheckpointContractError(
+                    "per-rank CUDA RNG state must contain exactly one device"
+                )
+            torch.cuda.set_rng_state(state["torch_cuda"][0], cuda_device)
 
 
 def _fsync_directory(path: Path) -> None:

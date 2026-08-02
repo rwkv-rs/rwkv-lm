@@ -65,6 +65,7 @@ def main() -> None:
 
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
+    fsdp2_training = str(args.strategy).lower() == "fsdp2"
 
     ########################################################################################################
 
@@ -107,7 +108,9 @@ def main() -> None:
         args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size
 
     args.run_name = f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
-    if not os.path.exists(args.proj_dir):
+    if fsdp2_training:
+        Path(args.proj_dir).mkdir(parents=True, exist_ok=True)
+    elif not os.path.exists(args.proj_dir):
         os.makedirs(args.proj_dir)
 
     args.epoch_count = args.magic_prime // 40320
@@ -245,6 +248,11 @@ def main() -> None:
 
     ########################################################################################################
 
+    if fsdp2_training:
+        from .fsdp2_trainer import prepare_fsdp2_launch_device
+
+        prepare_fsdp2_launch_device()
+
     from .trainer import train_callback, generate_init_weight
     from .dataset import MyDataset
 
@@ -289,8 +297,19 @@ def main() -> None:
     else:
         rank_zero_info(
             "Model, optimizer, scheduler, RNG, and data cursor will be restored "
-            "together when the Trainer is initialized."
+            "together when the training runtime is initialized."
         )
+
+    if fsdp2_training:
+        from .fsdp2_trainer import run_fsdp2_training
+
+        run_fsdp2_training(
+            args,
+            model,
+            train_data,
+            resume_checkpoint=resume_checkpoint,
+        )
+        return
 
     trainer = Trainer.from_argparse_args(
         args,

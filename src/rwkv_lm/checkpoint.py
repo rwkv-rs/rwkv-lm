@@ -1,7 +1,7 @@
 """Fail-closed identities for complete RWKV training checkpoints.
 
 This module defines the storage boundary only. It does not save framework state,
-restore a trainer, convert legacy weights, or implement FSDP2.
+restore a trainer, convert legacy weights, or run distributed collectives.
 """
 
 from __future__ import annotations
@@ -37,15 +37,56 @@ SUPPORTED_STATE_SERIALIZATIONS = MappingProxyType(
         "data_cursor": "rwkv-binidx-epoch-cursor-v1",
     }
 )
+SUPPORTED_MODEL_SERIALIZATIONS = frozenset(
+    {
+        "torch-state-dict",
+        "torch-distributed-checkpoint-model-v1",
+    }
+)
+SUPPORTED_OPTIMIZER_SERIALIZATIONS = frozenset(
+    {
+        "torch-optimizer-state",
+        "torch-distributed-checkpoint-optimizer-v1",
+    }
+)
 SUPPORTED_SCHEDULER_SERIALIZATIONS = frozenset(
     {
         "rwkv-callback-schedule-v1",
         "torch-lr-scheduler-json-v1",
     }
 )
+SUPPORTED_RNG_SERIALIZATIONS = frozenset(
+    {
+        "torch-rng-state",
+        "torch-rng-state-per-rank-v1",
+    }
+)
+SUPPORTED_DATA_CURSOR_SERIALIZATIONS = frozenset(
+    {
+        "rwkv-binidx-epoch-cursor-v1",
+        "rwkv-binidx-epoch-cursor-sharded-v1",
+    }
+)
+_SUPPORTED_STATE_SERIALIZATION_SETS = MappingProxyType(
+    {
+        "model": SUPPORTED_MODEL_SERIALIZATIONS,
+        "optimizer": SUPPORTED_OPTIMIZER_SERIALIZATIONS,
+        "scheduler": SUPPORTED_SCHEDULER_SERIALIZATIONS,
+        "rng": SUPPORTED_RNG_SERIALIZATIONS,
+        "data_cursor": SUPPORTED_DATA_CURSOR_SERIALIZATIONS,
+    }
+)
+_TREE_STATE_SERIALIZATIONS = frozenset(
+    {
+        "torch-distributed-checkpoint-model-v1",
+        "torch-distributed-checkpoint-optimizer-v1",
+        "torch-rng-state-per-rank-v1",
+    }
+)
 SUPPORTED_STANDARD_PROFILES = frozenset(
     {
         ("deepspeed", "deepspeed_stage_2", "full"),
+        ("pytorch", "fsdp2", "sharded"),
         ("pytorch", "single_process", "full"),
         ("pytorch-lightning", "ddp", "full"),
         ("pytorch-lightning", "single_device", "full"),
@@ -85,6 +126,28 @@ class ArtifactRecord:
         root = _checkpoint_root(checkpoint_dir)
         path = _artifact_path(root, relative_path)
         size_bytes, sha256 = _file_identity(path)
+        return cls(
+            path=relative_path,
+            serialization=serialization,
+            sha256=sha256,
+            size_bytes=size_bytes,
+        )
+
+    @classmethod
+    def from_tree(
+        cls,
+        checkpoint_dir: Path,
+        relative_path: str,
+        *,
+        serialization: str,
+    ) -> ArtifactRecord:
+        if serialization not in _TREE_STATE_SERIALIZATIONS:
+            raise CheckpointContractError(
+                "artifact tree requires a registered tree serialization"
+            )
+        root = _checkpoint_root(checkpoint_dir)
+        path = _artifact_tree_path(root, relative_path)
+        size_bytes, sha256 = _tree_identity(path)
         return cls(
             path=relative_path,
             serialization=serialization,
@@ -266,22 +329,40 @@ class CheckpointManifest:
             raise CheckpointContractError(
                 "training_config serialization must be canonical-json"
             )
-        for name, expected_serialization in SUPPORTED_STATE_SERIALIZATIONS.items():
+        for (
+            name,
+            supported_serializations,
+        ) in _SUPPORTED_STATE_SERIALIZATION_SETS.items():
             actual_serialization = self.states[name].serialization
-            if name == "scheduler":
-                valid = actual_serialization in SUPPORTED_SCHEDULER_SERIALIZATIONS
-            else:
-                valid = actual_serialization == expected_serialization
-            if not valid:
+            if actual_serialization not in supported_serializations:
                 raise CheckpointContractError(
-                    f"checkpoint {name} serialization must be "
-                    + (
-                        "one of: "
-                        + ", ".join(sorted(SUPPORTED_SCHEDULER_SERIALIZATIONS))
-                        if name == "scheduler"
-                        else expected_serialization
-                    )
+                    f"checkpoint {name} serialization must be one of: "
+                    + ", ".join(sorted(supported_serializations))
                 )
+        sharded_serializations = {
+            "model": "torch-distributed-checkpoint-model-v1",
+            "optimizer": "torch-distributed-checkpoint-optimizer-v1",
+            "rng": "torch-rng-state-per-rank-v1",
+            "data_cursor": "rwkv-binidx-epoch-cursor-sharded-v1",
+        }
+        sharded_components = {
+            name
+            for name, serialization in sharded_serializations.items()
+            if self.states[name].serialization == serialization
+        }
+        sharded_backend = (
+            self.backend.name,
+            self.backend.strategy,
+            self.backend.state_dict_type,
+        ) == ("pytorch", "fsdp2", "sharded")
+        if sharded_components and sharded_components != set(sharded_serializations):
+            raise CheckpointContractError(
+                "FSDP2 sharded state serializations must be selected together"
+            )
+        if bool(sharded_components) != sharded_backend:
+            raise CheckpointContractError(
+                "FSDP2 sharded state serializations must match backend identity"
+            )
         paths = [self.training_config.path]
         paths.extend(record.path for record in self.states.values())
         if len(paths) != len(set(paths)):
@@ -357,8 +438,7 @@ class CheckpointManifest:
         root = _checkpoint_root(checkpoint_dir)
         records = [self.training_config, *self.states.values()]
         for record in records:
-            path = _artifact_path(root, record.path)
-            size_bytes, sha256 = _file_identity(path)
+            size_bytes, sha256 = _artifact_record_identity(root, record)
             if size_bytes != record.size_bytes:
                 raise CheckpointContractError(
                     f"checkpoint artifact size does not match manifest: {record.path}"
@@ -404,12 +484,19 @@ class CheckpointManifest:
             _artifact_path(root, self.states["data_cursor"].path),
             "data cursor",
         )
-        if set(data_cursor) != {
+        cursor_fields = {
             "next_epoch",
             "samples_per_epoch",
             "step_in_epoch",
             "world_size",
-        }:
+        }
+        sharded_cursor = (
+            self.states["data_cursor"].serialization
+            == "rwkv-binidx-epoch-cursor-sharded-v1"
+        )
+        if sharded_cursor:
+            cursor_fields.add("rank_ownership")
+        if set(data_cursor) != cursor_fields:
             raise CheckpointContractError("data cursor has invalid fields")
         for field in (
             "next_epoch",
@@ -431,6 +518,8 @@ class CheckpointManifest:
             raise CheckpointContractError(
                 "data cursor must match progress and backend world_size"
             )
+        if sharded_cursor:
+            _verify_sharded_rank_ownership(root, self, data_cursor["rank_ownership"])
 
     def write(self, checkpoint_dir: Path) -> Path:
         root = _checkpoint_root(checkpoint_dir)
@@ -631,6 +720,198 @@ def _artifact_path(root: Path, relative_path: str) -> Path:
     return path
 
 
+def _artifact_tree_path(root: Path, relative_path: str) -> Path:
+    _validate_relative_path(relative_path, "artifact path")
+    path = root
+    for part in PurePosixPath(relative_path).parts:
+        path /= part
+        if path.is_symlink():
+            raise CheckpointContractError(
+                f"checkpoint artifact tree must not use symlinks: {relative_path}"
+            )
+    try:
+        path.resolve().relative_to(root)
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise CheckpointContractError(
+            "checkpoint artifact tree is missing or outside the checkpoint: "
+            f"{relative_path}"
+        ) from error
+    if not path.is_dir():
+        raise CheckpointContractError(
+            f"checkpoint artifact tree must be a directory: {relative_path}"
+        )
+    return path
+
+
+def _tree_files(tree: Path) -> list[tuple[str, Path]]:
+    files = []
+    for path in sorted(tree.rglob("*")):
+        if path.is_symlink():
+            raise CheckpointContractError(
+                f"checkpoint artifact tree must not use symlinks: {path}"
+            )
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise CheckpointContractError(
+                f"checkpoint artifact tree entry must be regular: {path}"
+            )
+        files.append((path.relative_to(tree).as_posix(), path))
+    if not files:
+        raise CheckpointContractError(
+            f"checkpoint artifact tree must contain files: {tree}"
+        )
+    return files
+
+
+def _tree_identity(tree: Path) -> tuple[int, str]:
+    inventory = []
+    size_bytes = 0
+    for relative_path, path in _tree_files(tree):
+        file_size, sha256 = _file_identity(path)
+        size_bytes += file_size
+        inventory.append(
+            {
+                "path": relative_path,
+                "sha256": sha256,
+                "size_bytes": file_size,
+            }
+        )
+    if size_bytes <= 0:
+        raise CheckpointContractError(
+            f"checkpoint artifact tree must contain non-empty data: {tree}"
+        )
+    identity = json.dumps(
+        {"format": "rwkv-checkpoint-tree-v1", "files": inventory},
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return size_bytes, hashlib.sha256(identity).hexdigest()
+
+
+def _artifact_record_identity(
+    root: Path,
+    record: ArtifactRecord,
+) -> tuple[int, str]:
+    if record.serialization in _TREE_STATE_SERIALIZATIONS:
+        return _tree_identity(_artifact_tree_path(root, record.path))
+    return _file_identity(_artifact_path(root, record.path))
+
+
+def _tree_checkpoint_paths(root: Path, relative_path: str) -> set[str]:
+    tree = _artifact_tree_path(root, relative_path)
+    return {
+        str(PurePosixPath(relative_path) / file_path)
+        for file_path, _ in _tree_files(tree)
+    }
+
+
+def _verify_sharded_rank_ownership(
+    root: Path,
+    manifest: CheckpointManifest,
+    raw: object,
+) -> None:
+    if (
+        manifest.backend.name,
+        manifest.backend.strategy,
+        manifest.backend.state_dict_type,
+    ) != ("pytorch", "fsdp2", "sharded"):
+        raise CheckpointContractError(
+            "sharded data cursor requires a pytorch/fsdp2/sharded backend"
+        )
+    expected_serializations = {
+        "model": "torch-distributed-checkpoint-model-v1",
+        "optimizer": "torch-distributed-checkpoint-optimizer-v1",
+        "rng": "torch-rng-state-per-rank-v1",
+    }
+    for component, serialization in expected_serializations.items():
+        if manifest.states[component].serialization != serialization:
+            raise CheckpointContractError(
+                f"sharded data cursor requires {component} serialization "
+                f"{serialization}"
+            )
+
+    ownership = _exact_mapping(
+        raw,
+        {"coordinator_rank", "model", "optimizer", "rng"},
+        "rank ownership",
+    )
+    if (
+        isinstance(ownership["coordinator_rank"], bool)
+        or ownership["coordinator_rank"] != 0
+    ):
+        raise CheckpointContractError("rank ownership coordinator_rank must be 0")
+    expected_ranks = {str(rank) for rank in range(manifest.backend.world_size)}
+
+    for component in ("model", "optimizer"):
+        record = manifest.states[component]
+        component_ownership = _exact_mapping(
+            ownership[component],
+            {"metadata", "shards"},
+            f"{component} rank ownership",
+        )
+        metadata_path = f"{record.path}/.metadata"
+        if component_ownership["metadata"] != metadata_path:
+            raise CheckpointContractError(
+                f"{component} rank ownership metadata path is invalid"
+            )
+        shards = _mapping(
+            component_ownership["shards"],
+            f"{component} rank shards",
+        )
+        if set(shards) != expected_ranks:
+            raise CheckpointContractError(
+                f"{component} rank ownership must cover every rank"
+            )
+        declared_paths = {metadata_path}
+        for rank in sorted(expected_ranks, key=int):
+            rank_paths = shards[rank]
+            if (
+                not isinstance(rank_paths, list)
+                or not rank_paths
+                or any(not isinstance(path, str) for path in rank_paths)
+            ):
+                raise CheckpointContractError(
+                    f"{component} rank {rank} must own a non-empty shard list"
+                )
+            for path in rank_paths:
+                _validate_relative_path(path, f"{component} rank shard path")
+                if (
+                    not path.startswith(f"{record.path}/")
+                    or not PurePosixPath(path).name.startswith(f"__{rank}_")
+                    or not path.endswith(".distcp")
+                ):
+                    raise CheckpointContractError(
+                        f"{component} rank {rank} shard ownership is invalid"
+                    )
+                if path in declared_paths:
+                    raise CheckpointContractError(
+                        f"{component} rank shard ownership must be unique"
+                    )
+                declared_paths.add(path)
+        if declared_paths != _tree_checkpoint_paths(root, record.path):
+            raise CheckpointContractError(
+                f"{component} rank ownership does not match its artifact tree"
+            )
+
+    rng_record = manifest.states["rng"]
+    rng_ownership = _mapping(ownership["rng"], "RNG rank ownership")
+    if set(rng_ownership) != expected_ranks:
+        raise CheckpointContractError("RNG rank ownership must cover every rank")
+    rng_paths = set()
+    for rank in sorted(expected_ranks, key=int):
+        expected_path = f"{rng_record.path}/rank-{int(rank):05d}.pt"
+        if rng_ownership[rank] != expected_path:
+            raise CheckpointContractError(f"RNG rank {rank} ownership path is invalid")
+        rng_paths.add(expected_path)
+    if rng_paths != _tree_checkpoint_paths(root, rng_record.path):
+        raise CheckpointContractError(
+            "RNG rank ownership does not match its artifact tree"
+        )
+
+
 def _file_identity(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     size_bytes = 0
@@ -675,6 +956,10 @@ __all__ = [
     "CHECKPOINT_MANIFEST_FILENAME",
     "CHECKPOINT_SCHEMA_VERSION",
     "REQUIRED_STATE_COMPONENTS",
+    "SUPPORTED_DATA_CURSOR_SERIALIZATIONS",
+    "SUPPORTED_MODEL_SERIALIZATIONS",
+    "SUPPORTED_OPTIMIZER_SERIALIZATIONS",
+    "SUPPORTED_RNG_SERIALIZATIONS",
     "SUPPORTED_SCHEDULER_SERIALIZATIONS",
     "SUPPORTED_STANDARD_PROFILES",
     "SUPPORTED_STATE_SERIALIZATIONS",

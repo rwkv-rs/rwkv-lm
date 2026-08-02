@@ -6,6 +6,7 @@ import os, sys, math, gc, importlib
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
@@ -1014,7 +1015,7 @@ class RWKV(pl.LightningModule):
         self.ln_out = nn.LayerNorm(args.n_embd)
         self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
 
-    def configure_optimizers(self):
+    def build_optimizer_groups(self, *, is_global_zero=None):
         args = self.args
 
         lr_decay = set()
@@ -1032,7 +1033,9 @@ class RWKV(pl.LightningModule):
         lr_1x = sorted(list(lr_1x))
         lr_2x = sorted(list(lr_2x))
 
-        if self.trainer.is_global_zero:
+        if is_global_zero is None:
+            is_global_zero = self.trainer.is_global_zero
+        if is_global_zero:
             print('decay', lr_decay, '\n')
             print('1x', lr_1x, '\n')
             print('2x', lr_2x, '\n')
@@ -1046,6 +1049,13 @@ class RWKV(pl.LightningModule):
 
         if args.weight_decay > 0:
             optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
+        return optim_groups
+
+    def configure_optimizers(self):
+        args = self.args
+        optim_groups = self.build_optimizer_groups()
+
+        if args.weight_decay > 0:
             if self.deepspeed_offload:
                 return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
             return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
@@ -1072,7 +1082,15 @@ class RWKV(pl.LightningModule):
         v_first = torch.empty_like(x)
         for block in self.blocks:
             if args.grad_cp == 1 and torch.is_grad_enabled():
-                x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
+                if str(args.strategy).lower() == "fsdp2":
+                    x, v_first = torch_checkpoint(
+                        block,
+                        x,
+                        v_first,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
             else:
                 x, v_first = block(x, v_first)
 
@@ -1130,7 +1148,7 @@ class RWKV(pl.LightningModule):
         new_wkv_states = []
         for layer_id, block in enumerate(self.blocks):
             if args.grad_cp == 1 and torch.is_grad_enabled():
-                x, v_first, new_tmix_shift_state, new_wkv_state, new_cmix_shift_state = deepspeed.checkpointing.checkpoint(
+                checkpoint_args = (
                     block.forward_infctx,
                     x,
                     v_first,
@@ -1138,6 +1156,22 @@ class RWKV(pl.LightningModule):
                     wkv_states[layer_id],
                     shift_states[layer_id, 1],
                 )
+                if str(args.strategy).lower() == "fsdp2":
+                    (
+                        x,
+                        v_first,
+                        new_tmix_shift_state,
+                        new_wkv_state,
+                        new_cmix_shift_state,
+                    ) = torch_checkpoint(*checkpoint_args, use_reentrant=False)
+                else:
+                    (
+                        x,
+                        v_first,
+                        new_tmix_shift_state,
+                        new_wkv_state,
+                        new_cmix_shift_state,
+                    ) = deepspeed.checkpointing.checkpoint(*checkpoint_args)
             else:
                 x, v_first, new_tmix_shift_state, new_wkv_state, new_cmix_shift_state = block.forward_infctx(
                     x,

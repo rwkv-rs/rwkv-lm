@@ -6,7 +6,7 @@
 #
 # The trainer resumes from the newest verified checkpoints/epoch-* directory.
 # If none exists, rwkv-init.pth is accepted only as a model initialization input.
-# Standard checkpoint v1 currently fails closed for distributed strategies.
+# FSDP2 writes one verified sharded checkpoint transaction across all ranks.
 #
 # !!! If launch gets stuck, clean lock files in your TORCH_EXTENSIONS_DIR !!!
 #
@@ -44,12 +44,10 @@ EPOCH_SAVE=10 # save every 10 "miniepochs" (1 miniepoch = 40320 * ctx_len tokens
 N_NODE=1 # number of nodes
 GPU_PER_NODE=1 # number of GPUs per node
 #
-# DS_BUCKET_MB=2 # set to 2 for consumer GPUs, set to 200 for A100 / H100 (affects speed & vram usage) UPDATE: very buggy in new deepspeed, so I disabled it
-#
-python train.py --wandb "Test" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
+torchrun --standalone --nnodes=$N_NODE --nproc-per-node=$GPU_PER_NODE train.py --wandb "Test" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --train_stage 3 --epoch_count 999999 --epoch_begin 0 \
  --data_file "data/minipile" --my_exit_tokens 1498226207 --magic_prime 2926181 \
  --num_nodes $N_NODE --micro_bsz $M_BSZ --n_layer $N_LAYER --n_embd $N_EMBD --kernel $KERNEL \
  --lr_init $LR_INIT --lr_final $LR_FINAL --warmup_steps 10 --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 --data_type "binidx" --vocab_size 65536 \
  --weight_decay 0.001 --epoch_save $EPOCH_SAVE --head_size 64 --head_chunk $HEAD_CHUNK \
- --accelerator gpu --devices $GPU_PER_NODE --precision bf16 --strategy deepspeed_stage_2 --grad_cp $GRAD_CP --enable_progress_bar True #--ds_bucket_mb $DS_BUCKET_MB
+ --accelerator gpu --devices $GPU_PER_NODE --precision bf16 --strategy fsdp2 --grad_cp $GRAD_CP --enable_progress_bar True

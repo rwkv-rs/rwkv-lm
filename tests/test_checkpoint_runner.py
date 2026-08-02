@@ -18,7 +18,7 @@ from rwkv_lm.checkpoint import (
     select_checkpoint_loader,
 )
 from rwkv_lm.checkpoint_runner import EpochCheckpointRunnerAdapter
-from rwkv_lm.trainer import train_callback
+from rwkv_lm.trainer import scheduled_learning_rate, train_callback
 
 
 def _backend(*, version: str = "1.9.5") -> BackendIdentity:
@@ -270,6 +270,25 @@ def test_lightning_callback_owns_standard_save_and_resume_boundary(
 
     _assert_nested_equal(resumed_model.state_dict(), model.state_dict())
     _assert_nested_equal(resumed_optimizer.state_dict(), optimizer.state_dict())
+
+
+def test_callback_schedule_uses_absolute_global_step() -> None:
+    args = SimpleNamespace(
+        ctx_len=16,
+        lr_final=1e-4,
+        lr_init=1e-3,
+        my_exit_tokens=0,
+        real_bsz=4,
+        warmup_steps=10,
+    )
+
+    first_lr, first_stop = scheduled_learning_rate(args, 0)
+    resumed_lr, resumed_stop = scheduled_learning_rate(args, 10)
+
+    assert first_lr == pytest.approx(1e-5)
+    assert resumed_lr == pytest.approx(args.lr_init)
+    assert first_stop is False
+    assert resumed_stop is False
 
 
 def test_transaction_failure_leaves_no_published_or_partial_checkpoint(

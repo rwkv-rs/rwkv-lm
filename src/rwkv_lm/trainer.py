@@ -99,6 +99,36 @@ def _checkpoint_backend_identity(trainer):
     )
 
 
+def scheduled_learning_rate(args, global_step):
+    """Return the stateless RWKV learning rate and whether its token limit hit."""
+
+    lr = args.lr_init
+    reached_token_limit = False
+    warmup_steps = args.warmup_steps
+    if args.my_exit_tokens != 0:
+        real_tokens = global_step * args.ctx_len * args.real_bsz
+        warmup_tokens = warmup_steps * args.ctx_len * args.real_bsz
+        decay_tokens = abs(args.my_exit_tokens) - warmup_tokens
+        if decay_tokens <= 0:
+            raise CheckpointContractError(
+                "my_exit_tokens must exceed the configured warmup token count"
+            )
+        progress = (real_tokens - warmup_tokens) / decay_tokens
+        progress = max(0, min(1, progress))
+        lr_final_factor = args.lr_final / args.lr_init
+        lr_mult = (0.5 + lr_final_factor / 2) + (
+            0.5 - lr_final_factor / 2
+        ) * math.cos(math.pi * progress)
+        if args.my_exit_tokens > 0:
+            lr = args.lr_init * lr_mult
+        else:
+            lr = (lr + args.lr_init * lr_mult) / 2
+        reached_token_limit = progress >= 1
+    if warmup_steps > 0 and global_step < warmup_steps:
+        lr *= 0.01 + 0.99 * global_step / warmup_steps
+    return lr, reached_token_limit
+
+
 class train_callback(pl.Callback):
     def __init__(self, args, *, resume_checkpoint=None):
         super().__init__()
@@ -178,24 +208,9 @@ class train_callback(pl.Callback):
 
         real_step = trainer.global_step + args.epoch_begin * args.epoch_steps
 
-        # LR schedule
-        w_step = args.warmup_steps
-
-        if args.my_exit_tokens != 0: # cosine decay
-            real_tokens = real_step * args.ctx_len * args.real_bsz
-            warmup_tokens = w_step * args.ctx_len * args.real_bsz
-            progress = (real_tokens - warmup_tokens) / (abs(args.my_exit_tokens) - warmup_tokens)
-            progress = max(0, min(1, progress))
-            lr_final_factor = args.lr_final / args.lr_init                
-            lr_mult = (0.5 + lr_final_factor / 2) + (0.5 - lr_final_factor / 2) * math.cos(math.pi * progress)
-            if args.my_exit_tokens > 0:
-                lr = args.lr_init * lr_mult
-            else:
-                lr = (lr + args.lr_init * lr_mult) / 2
-            if progress >= 1:
-                self._request_epoch_boundary_stop(trainer, batch_idx)
-        if trainer.global_step < w_step:
-            lr = lr * (0.01 + 0.99 * trainer.global_step / w_step)
+        lr, reached_token_limit = scheduled_learning_rate(args, real_step)
+        if reached_token_limit:
+            self._request_epoch_boundary_stop(trainer, batch_idx)
 
         wd_now = args.weight_decay
 
