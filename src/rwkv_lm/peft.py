@@ -237,6 +237,53 @@ def lora_base_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
+def lora_merged_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Return standalone base weights with every trained LoRA delta merged."""
+
+    config = _model_lora_config(model)
+    validate_lora_trainable_parameters(model, config)
+    merged_state = {
+        name: tensor.detach().cpu().contiguous().clone()
+        for name, tensor in lora_base_state_dict(model).items()
+    }
+    modules = dict(model.named_modules())
+    merged_projection_names = set()
+    for adapter_name, adapter in modules.items():
+        if not isinstance(adapter, LoraDelta):
+            continue
+        if not adapter_name.endswith("_lora"):
+            raise PeftContractError(
+                f"LoRA adapter module name cannot identify its base: {adapter_name}"
+            )
+        projection_name = adapter_name.removesuffix("_lora")
+        projection = modules.get(projection_name)
+        if not isinstance(projection, nn.Linear):
+            raise PeftContractError(
+                f"LoRA adapter base is not a linear projection: {adapter_name}"
+            )
+        if projection_name in merged_projection_names:
+            raise PeftContractError(
+                f"multiple LoRA adapters target one projection: {projection_name}"
+            )
+        merged_projection_names.add(projection_name)
+        weight_name = f"{projection_name}.weight"
+        if weight_name not in merged_state:
+            raise PeftContractError(
+                f"LoRA base state is missing projection weight: {weight_name}"
+            )
+        delta = (adapter.lora_B.detach() @ adapter.lora_A.detach()) * adapter.scaling
+        if delta.shape != projection.weight.shape:
+            raise PeftContractError(
+                f"LoRA merged delta shape does not match: {adapter_name}"
+            )
+        merged_state[weight_name] = (
+            projection.weight.detach() + delta.to(projection.weight.dtype)
+        ).cpu().contiguous()
+    if not merged_projection_names:
+        raise PeftContractError("enabled LoRA model has no mergeable projections")
+    return merged_state
+
+
 def load_lora_base_state_dict(
     model: nn.Module,
     state_dict: Mapping[str, torch.Tensor],
@@ -278,21 +325,36 @@ def save_lora_adapter(model: nn.Module, path: Path) -> Path:
 
     config = _model_lora_config(model)
     validate_lora_trainable_parameters(model, config)
-    destination = Path(path)
-    if destination.exists() or destination.is_symlink():
-        raise PeftContractError(f"LoRA adapter destination exists: {destination}")
-    parent = destination.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    if parent.is_symlink() or not parent.is_dir():
-        raise PeftContractError(
-            f"LoRA adapter parent must be a regular directory: {parent}"
-        )
     payload = {
         "format": _ADAPTER_FORMAT,
         "schema_version": _ADAPTER_SCHEMA_VERSION,
         "config": config.to_dict(),
         "state_dict": lora_adapter_state_dict(model),
     }
+    return _atomic_torch_save(payload, Path(path), "LoRA adapter")
+
+
+def save_lora_merged_model(model: nn.Module, path: Path) -> Path:
+    """Atomically export weights strict-loadable by a LoRA-disabled model."""
+
+    return _atomic_torch_save(
+        lora_merged_state_dict(model),
+        Path(path),
+        "LoRA merged model",
+    )
+
+
+def _atomic_torch_save(payload: object, destination: Path, owner: str) -> Path:
+    """Publish one Torch artifact without replacing an existing destination."""
+
+    if destination.exists() or destination.is_symlink():
+        raise PeftContractError(f"{owner} destination exists: {destination}")
+    parent = destination.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink() or not parent.is_dir():
+        raise PeftContractError(
+            f"{owner} parent must be a regular directory: {parent}"
+        )
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.partial-",
         dir=parent,
@@ -307,7 +369,7 @@ def save_lora_adapter(model: nn.Module, path: Path) -> Path:
             os.link(temporary, destination)
         except FileExistsError as error:
             raise PeftContractError(
-                f"LoRA adapter destination exists: {destination}"
+                f"{owner} destination exists: {destination}"
             ) from error
         destination.chmod(0o600)
         temporary.unlink()
@@ -477,7 +539,9 @@ __all__ = [
     "load_lora_base_state_dict",
     "lora_adapter_state_dict",
     "lora_base_state_dict",
+    "lora_merged_state_dict",
     "lora_parameter_names",
     "save_lora_adapter",
+    "save_lora_merged_model",
     "validate_lora_trainable_parameters",
 ]

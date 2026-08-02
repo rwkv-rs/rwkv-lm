@@ -17,8 +17,10 @@ from rwkv_lm.peft import (
     load_lora_adapter,
     load_lora_base_state_dict,
     lora_base_state_dict,
+    lora_merged_state_dict,
     lora_parameter_names,
     save_lora_adapter,
+    save_lora_merged_model,
 )
 
 
@@ -213,6 +215,41 @@ def test_standard_checkpoint_restores_adapter_and_optimizer_state(
     _step(resumed, resumed_optimizer, inputs, targets)
     _assert_nested_equal(resumed.state_dict(), model.state_dict())
     _assert_nested_equal(resumed_optimizer.state_dict(), optimizer.state_dict())
+
+
+def test_merged_model_fresh_reload_matches_adapter_inference(tmp_path: Path) -> None:
+    torch.manual_seed(20260801)
+    model = _TinyLoraModel(_config())
+    optimizer = _optimizer(model)
+    inputs = torch.randn(5, 4)
+    targets = torch.randn(5, 3)
+    _step(model, optimizer, inputs, targets)
+    _step(model, optimizer, inputs, targets)
+    model.eval()
+    expected_output = model(inputs).detach()
+    base_before_merge = {
+        name: tensor.detach().clone()
+        for name, tensor in lora_base_state_dict(model).items()
+    }
+
+    merged_state = lora_merged_state_dict(model)
+    assert set(merged_state) == set(base_before_merge)
+    assert not any(name.endswith((".lora_A", ".lora_B")) for name in merged_state)
+    _assert_nested_equal(lora_base_state_dict(model), base_before_merge)
+    torch.testing.assert_close(model(inputs), expected_output, rtol=0, atol=0)
+
+    artifact = save_lora_merged_model(model, tmp_path / "merged-model.pth")
+    fresh_state = torch.load(artifact, map_location="cpu", weights_only=True)
+    fresh_model = _TinyLoraModel(LoraConfig())
+    fresh_model.load_state_dict(fresh_state, strict=True)
+    fresh_model.eval()
+
+    torch.testing.assert_close(
+        fresh_model(inputs),
+        expected_output,
+        rtol=1e-6,
+        atol=1e-7,
+    )
 
 
 def test_disabled_or_incomplete_lora_does_not_create_trainable_adapters() -> None:

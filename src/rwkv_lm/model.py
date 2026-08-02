@@ -29,7 +29,9 @@ from .peft import (
     load_lora_base_state_dict,
     lora_adapter_state_dict,
     lora_base_state_dict,
+    lora_merged_state_dict,
     save_lora_adapter as save_lora_adapter_artifact,
+    save_lora_merged_model as save_lora_merged_model_artifact,
 )
 
 try:
@@ -1121,6 +1123,9 @@ class RWKV(pl.LightningModule):
     def base_state_dict(self):
         return lora_base_state_dict(self)
 
+    def lora_merged_state_dict(self):
+        return lora_merged_state_dict(self)
+
     def load_base_state_dict(self, state_dict, *, allow_partial=False):
         load_lora_base_state_dict(
             self,
@@ -1133,6 +1138,9 @@ class RWKV(pl.LightningModule):
 
     def load_lora_adapter(self, path):
         return load_lora_adapter_artifact(self, path)
+
+    def save_lora_merged_model(self, path):
+        return save_lora_merged_model_artifact(self, path)
 
     def build_optimizer_groups(self, *, is_global_zero=None):
         args = self.args
