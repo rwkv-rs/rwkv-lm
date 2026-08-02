@@ -37,6 +37,21 @@ def main() -> None:
         default="standard",
     )
     parser.add_argument("--chunk_ctx", default=0, type=int)
+    parser.add_argument("--lora_rank", default=0, type=int)
+    parser.add_argument("--lora_alpha", default=0.0, type=float)
+    parser.add_argument("--lora_dropout", default=0.0, type=float)
+    parser.add_argument(
+        "--lora_target_modules",
+        default="",
+        type=str,
+        help="comma-separated explicit TimeMix/ChannelMix projection targets",
+    )
+    parser.add_argument(
+        "--lora_adapter",
+        default="",
+        type=str,
+        help="adapter-only artifact loaded after the base model",
+    )
     parser.add_argument("--epoch_steps", default=1000, type=int)  # a mini "epoch" has [epoch_steps] steps
     parser.add_argument("--epoch_count", default=500, type=int)  # train for this many "epochs". will continue afterwards with lr = lr_final
     parser.add_argument("--epoch_begin", default=0, type=int)  # if you load a model trained for x "epochs", set epoch_begin = x
@@ -80,6 +95,7 @@ def main() -> None:
     import torch
     from torch.utils.data import DataLoader
     from .infctx import InfctxContractError, validate_infctx_chunk_ctx
+    from .peft import LoraConfig, PeftContractError
     if "deepspeed" in args.strategy:
         import deepspeed
     from pytorch_lightning import seed_everything
@@ -104,6 +120,19 @@ def main() -> None:
     args.max_epochs = -1  # continue forever
     args.betas = (args.beta1, args.beta2)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
+    lora_config = LoraConfig.from_namespace(args)
+    args.lora_rank = lora_config.rank
+    args.lora_alpha = lora_config.alpha
+    args.lora_dropout = lora_config.dropout
+    args.lora_target_modules = lora_config.target_modules
+    if args.lora_adapter and not lora_config.enabled:
+        raise PeftContractError(
+            "lora_adapter requires an enabled and explicitly configured LoRA model"
+        )
+    if lora_config.enabled and args.train_stage == 1:
+        raise PeftContractError(
+            "LoRA training requires an existing base checkpoint, not train_stage=1"
+        )
     if args.train_type == "infctx":
         validate_infctx_chunk_ctx(args.chunk_ctx, ctx_len=args.ctx_len)
         if args.ctx_len % 16 != 0:
@@ -186,6 +215,14 @@ def main() -> None:
     if resume_checkpoint is not None and args.load_partial == 1:
         raise CheckpointContractError(
             "standard resume does not allow partial model loading"
+        )
+    if resume_checkpoint is not None and args.lora_adapter:
+        raise PeftContractError(
+            "standard resume restores its own adapter and does not accept lora_adapter"
+        )
+    if resume_checkpoint is None and lora_config.enabled and not args.load_model:
+        raise PeftContractError(
+            "fresh LoRA training requires a legacy base model checkpoint"
         )
     if (
         resume_checkpoint is None
@@ -306,12 +343,20 @@ def main() -> None:
             if k.startswith('_forward_module.'):
                 load_dict[k.replace('_forward_module.','')] = load_dict[k]
                 del load_dict[k]
-        if args.load_partial == 1:
-            load_keys = load_dict.keys()
-            for k in model.state_dict():
-                if k not in load_keys:
-                    load_dict[k] = model.state_dict()[k]
-        model.load_state_dict(load_dict)
+        if model.lora_config.enabled:
+            model.load_base_state_dict(
+                load_dict,
+                allow_partial=args.load_partial == 1,
+            )
+            if args.lora_adapter:
+                model.load_lora_adapter(Path(args.lora_adapter))
+        else:
+            if args.load_partial == 1:
+                load_keys = load_dict.keys()
+                for k in model.state_dict():
+                    if k not in load_keys:
+                        load_dict[k] = model.state_dict()[k]
+            model.load_state_dict(load_dict)
     else:
         rank_zero_info(
             "Model, optimizer, scheduler, RNG, and data cursor will be restored "

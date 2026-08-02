@@ -21,6 +21,16 @@ from .infctx import (
     recurrent_chunk_forward,
     validate_infctx_chunk_ctx,
 )
+from .peft import (
+    LoraConfig,
+    build_lora_delta,
+    freeze_base_for_lora,
+    load_lora_adapter as load_lora_adapter_artifact,
+    load_lora_base_state_dict,
+    lora_adapter_state_dict,
+    lora_base_state_dict,
+    save_lora_adapter as save_lora_adapter_artifact,
+)
 
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
@@ -133,7 +143,9 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
             y,sT = RWKV7_STATEPASSING_CLAMPW_CUDA_OP.apply(s0.contiguous(),r,w,k,v,a,b)
             return y.view(B,T,HN),sT
     else:
-        def RWKV7_STATEPASSING_CLAMPW_CUDA(s0,r,w,k,v,a,b):
+        def RWKV7_STATEPASSING_CLAMPW_CUDA(
+            s0, r, w, k, v, a, b
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             raise RuntimeError(
                 "RWKV infctx requires RWKV_TRAIN_TYPE=infctx before importing "
                 "rwkv_lm.model."
@@ -648,7 +660,7 @@ if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:
 ########################################################################################################
 
 class RWKV_Tmix_x070(MyModule):
-    def __init__(self, args, layer_id):
+    def __init__(self, args, layer_id, lora_config):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
@@ -733,6 +745,30 @@ class RWKV_Tmix_x070(MyModule):
             self.key = nn.Linear(C, C, bias=False)
             self.value = nn.Linear(C, C, bias=False)
             self.output = nn.Linear(C, C, bias=False)
+            self.receptance_lora = build_lora_delta(
+                lora_config,
+                "time_mix.receptance",
+                in_features=C,
+                out_features=C,
+            )
+            self.key_lora = build_lora_delta(
+                lora_config,
+                "time_mix.key",
+                in_features=C,
+                out_features=C,
+            )
+            self.value_lora = build_lora_delta(
+                lora_config,
+                "time_mix.value",
+                in_features=C,
+                out_features=C,
+            )
+            self.output_lora = build_lora_delta(
+                lora_config,
+                "time_mix.output",
+                in_features=C,
+                out_features=C,
+            )
             self.ln_x = nn.GroupNorm(H, C, eps=64e-5) # !!! notice eps value !!!
 
             self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
@@ -768,9 +804,15 @@ class RWKV_Tmix_x070(MyModule):
         ############################################################
 
         r = self.receptance(xr)
+        if self.receptance_lora.enabled:
+            r = r + self.receptance_lora(xr)
         w = self.w0 + torch.tanh(xw @ self.w1) @ self.w2 # will be soft-clamped to (-inf, -0.5) and exp(-exp(w)) in RWKV7_CLAMPW_CUDA kernel
         k = self.key(xk)
+        if self.key_lora.enabled:
+            k = k + self.key_lora(xk)
         v = self.value(xv)
+        if self.value_lora.enabled:
+            v = v + self.value_lora(xv)
         if self.layer_id == 0:
             v_first = v # store the v of the first layer
         else:
@@ -827,7 +869,10 @@ class RWKV_Tmix_x070(MyModule):
                 self.ln_x.bias,
                 g,
         )
-        x = self.output(x)
+        output_input = x
+        x = self.output(output_input)
+        if self.output_lora.enabled:
+            x = x + self.output_lora(output_input)
         ############################################################
 
         return x, v_first
@@ -848,9 +893,15 @@ class RWKV_Tmix_x070(MyModule):
         )
 
         r = self.receptance(xr)
+        if self.receptance_lora.enabled:
+            r = r + self.receptance_lora(xr)
         w = self.w0 + torch.tanh(xw @ self.w1) @ self.w2
         k = self.key(xk)
+        if self.key_lora.enabled:
+            k = k + self.key_lora(xk)
         v = self.value(xv)
+        if self.value_lora.enabled:
+            v = v + self.value_lora(xv)
         if self.layer_id == 0:
             v_first = v
         else:
@@ -877,7 +928,10 @@ class RWKV_Tmix_x070(MyModule):
                 self.ln_x.bias,
                 g,
         )
-        x = self.output(x)
+        output_input = x
+        x = self.output(output_input)
+        if self.output_lora.enabled:
+            x = x + self.output_lora(output_input)
         return x, v_first, new_shift_state, new_wkv_state
 
 ########################################################################################################
@@ -912,7 +966,7 @@ class RWKV_Tmix_x070(MyModule):
 #         return self.value(k)
 
 class RWKV_CMix_x070(nn.Module): # fast CUDA version
-    def __init__(self, args, layer_id):
+    def __init__(self, args, layer_id, lora_config):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
@@ -926,14 +980,33 @@ class RWKV_CMix_x070(nn.Module): # fast CUDA version
 
         self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
         self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
+        self.key_lora = build_lora_delta(
+            lora_config,
+            "channel_mix.key",
+            in_features=args.n_embd,
+            out_features=args.n_embd * 4,
+        )
+        self.value_lora = build_lora_delta(
+            lora_config,
+            "channel_mix.value",
+            in_features=args.n_embd * 4,
+            out_features=args.n_embd,
+        )
+        self.lora_enabled = self.key_lora.enabled or self.value_lora.enabled
 
         self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
         self.value.weight.data.zero_()
 
     def forward(self, x):
+        if self.lora_enabled:
+            shifted = torch.cat((torch.zeros_like(x[:, :1]), x[:, :-1]), dim=1)
+            return self._forward_lora(x, shifted)
         return _CmixLayerV2Fn.apply(x, self.x_k.view(-1), self.key.weight, self.value.weight)
 
     def forward_infctx(self, x, shift_state):
+        if self.lora_enabled:
+            shifted = torch.cat((shift_state.unsqueeze(1), x[:, :-1]), dim=1)
+            return self._forward_lora(x, shifted), x[:, -1]
         return _CmixStateLayerV2Fn.apply(
             x,
             shift_state,
@@ -942,12 +1015,23 @@ class RWKV_CMix_x070(nn.Module): # fast CUDA version
             self.value.weight,
         )
 
+    def _forward_lora(self, x, shifted):
+        mixed = x + (shifted - x) * self.x_k
+        key = self.key(mixed)
+        if self.key_lora.enabled:
+            key = key + self.key_lora(mixed)
+        activated = torch.relu(key).square()
+        value = self.value(activated)
+        if self.value_lora.enabled:
+            value = value + self.value_lora(activated)
+        return value
+
 ########################################################################################################
 # The RWKV Model with our blocks
 ########################################################################################################
 
 class Block(nn.Module):
-    def __init__(self, args, layer_id):
+    def __init__(self, args, layer_id, lora_config):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
@@ -958,8 +1042,8 @@ class Block(nn.Module):
         if self.layer_id == 0:
             self.ln0 = nn.LayerNorm(args.n_embd)
 
-        self.att = RWKV_Tmix_x070(args, layer_id)
-        self.ffn = RWKV_CMix_x070(args, layer_id)
+        self.att = RWKV_Tmix_x070(args, layer_id, lora_config)
+        self.ffn = RWKV_CMix_x070(args, layer_id, lora_config)
 
     def forward(self, x, v_first):
         if self.layer_id == 0:
@@ -1008,6 +1092,11 @@ class RWKV(pl.LightningModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
+        self.lora_config = LoraConfig.from_namespace(args)
+        args.lora_rank = self.lora_config.rank
+        args.lora_alpha = self.lora_config.alpha
+        args.lora_dropout = self.lora_config.dropout
+        args.lora_target_modules = self.lora_config.target_modules
         if not hasattr(args, 'dim_att'):
             args.dim_att = args.n_embd
         if not hasattr(args, 'dim_ffn'):
@@ -1018,10 +1107,32 @@ class RWKV(pl.LightningModule):
 
         self.emb = nn.Embedding(args.vocab_size, args.n_embd)
 
-        self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
+        self.blocks = nn.ModuleList(
+            [Block(args, i, self.lora_config) for i in range(args.n_layer)]
+        )
 
         self.ln_out = nn.LayerNorm(args.n_embd)
         self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+        freeze_base_for_lora(self, self.lora_config)
+
+    def adapter_state_dict(self):
+        return lora_adapter_state_dict(self)
+
+    def base_state_dict(self):
+        return lora_base_state_dict(self)
+
+    def load_base_state_dict(self, state_dict, *, allow_partial=False):
+        load_lora_base_state_dict(
+            self,
+            state_dict,
+            allow_partial=allow_partial,
+        )
+
+    def save_lora_adapter(self, path):
+        return save_lora_adapter_artifact(self, path)
+
+    def load_lora_adapter(self, path):
+        return load_lora_adapter_artifact(self, path)
 
     def build_optimizer_groups(self, *, is_global_zero=None):
         args = self.args
@@ -1030,6 +1141,8 @@ class RWKV(pl.LightningModule):
         lr_1x = set()
         lr_2x = set()
         for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
             if ("att.w0" in n):
                 lr_2x.add(n)
             elif (len(p.squeeze().shape) >= 2) and (args.weight_decay > 0) and (".weight" in n):
@@ -1050,13 +1163,20 @@ class RWKV(pl.LightningModule):
 
         param_dict = {n: p for n, p in self.named_parameters()}
 
-        optim_groups = [
-            {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
-            {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
-        ]
+        optim_groups = []
+        if lr_1x:
+            optim_groups.append(
+                {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0}
+            )
+        if lr_2x:
+            optim_groups.append(
+                {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0}
+            )
 
-        if args.weight_decay > 0:
+        if args.weight_decay > 0 and lr_decay:
             optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
+        if not optim_groups:
+            raise RuntimeError("RWKV optimizer has no trainable parameters")
         return optim_groups
 
     def configure_optimizers(self):
