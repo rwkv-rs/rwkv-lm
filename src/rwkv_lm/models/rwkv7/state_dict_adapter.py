@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -17,6 +18,27 @@ _NATIVE_TO_HF_PREFIXES = (
     ("norm.", "model.ln_out."),
     ("lm_head.", "head."),
 )
+
+
+def validate_rwkv7_hf_checkpoint(config: Any) -> None:
+    """Fail before model construction when an HF initial checkpoint is incomplete."""
+    if not config.checkpoint.initial_load_in_hf:
+        return
+    checkpoint_path = Path(
+        config.checkpoint.initial_load_path or config.hf_assets_path
+    ).resolve()
+    required = [checkpoint_path / "config.json"]
+    has_weights = (checkpoint_path / "model.safetensors").is_file() or (
+        checkpoint_path / "model.safetensors.index.json"
+    ).is_file()
+    missing = [str(path) for path in required if not path.is_file()]
+    if not has_weights:
+        missing.append(f"{checkpoint_path}/model.safetensors[.index.json]")
+    if missing:
+        raise FileNotFoundError(
+            "RWKV initial_load_in_hf requires a standard transformers-rwkv "
+            f"checkpoint; missing {missing}"
+        )
 
 
 def _rename_prefix(
@@ -83,3 +105,45 @@ class Rwkv7StateDictAdapter(StateDictAdapter):
             _rename_prefix(name, hf_to_native): value
             for name, value in hf_state_dict.items()
         }
+
+    def adapter_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Return the exact LoRA tensors required for adapter-only persistence."""
+        expected = {
+            f"{fqn}.{adapter}.weight"
+            for fqn in self._lora_scales
+            for adapter in ("lora_a", "lora_b")
+        }
+        if not expected:
+            raise ValueError("RWKV model config does not contain LoRA adapters")
+        observed = expected.intersection(state_dict)
+        if observed != expected:
+            missing = sorted(expected - observed)
+            raise KeyError(f"incomplete RWKV LoRA adapter state: missing {missing}")
+        return {name: state_dict[name] for name in sorted(expected)}
+
+    def load_adapter_state_dict(
+        self,
+        model: Rwkv7Model,
+        adapter_state_dict: dict[str, Any],
+    ) -> None:
+        """Load an adapter-only state into a TorchTitan LoRA model."""
+        expected = set(self.adapter_state_dict(model.state_dict()))
+        observed = set(adapter_state_dict)
+        if observed != expected:
+            raise KeyError(
+                "RWKV LoRA adapter keys do not match this model: "
+                f"missing={sorted(expected - observed)}, "
+                f"unexpected={sorted(observed - expected)}"
+            )
+        if not all(
+            isinstance(adapter_state_dict[name], torch.Tensor) for name in observed
+        ):
+            raise TypeError("RWKV LoRA adapter state must contain only tensors")
+        incompatible = model.load_state_dict(adapter_state_dict, strict=False)
+        if incompatible.unexpected_keys:
+            raise KeyError(
+                f"unexpected RWKV LoRA adapter keys: {incompatible.unexpected_keys}"
+            )
+
+
+__all__ = ["Rwkv7StateDictAdapter", "validate_rwkv7_hf_checkpoint"]

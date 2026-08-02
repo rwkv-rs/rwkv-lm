@@ -1,267 +1,234 @@
-import os
-import torch
-import numpy as np
+"""Memory-mapped Megatron ``.bin``/``.idx`` token storage."""
+
+from __future__ import annotations
+
 import struct
-from functools import lru_cache
 from itertools import accumulate
+from pathlib import Path
+from types import TracebackType
+from typing import Self
 
-def print_rank_0(*message):
-    pass
-    # """If distributed is initialized print only on rank 0."""
-    # if torch.distributed.is_initialized():
-    #     if torch.distributed.get_rank() == 0:
-    #         print(*message, flush=True)
-    # else:
-    #     print(*message, flush=True)
+import numpy as np
+from torch.utils.data import Dataset
 
-def _warmup_mmap_file(path):
-    pass
-    # with open(path, "rb") as stream:
-    #     while stream.read(100 * 1024 * 1024):
-    #         pass
-
-dtypes = {
+_DTYPES = {
     1: np.uint8,
     2: np.int8,
     3: np.int16,
     4: np.int32,
     5: np.int64,
-    6: float,
-    7: np.double,
+    6: np.float32,
+    7: np.float64,
     8: np.uint16,
 }
 
-def code(dtype):
-    for k in dtypes.keys():
-        if dtypes[k] == dtype:
-            return k
-    raise ValueError(dtype)
 
-def index_file_path(prefix_path):
-    return prefix_path + ".idx"
+def index_file_path(prefix_path: str | Path) -> Path:
+    """Return the index path for a binidx prefix."""
+    return Path(f"{prefix_path}.idx")
 
-def data_file_path(prefix_path):
-    return prefix_path + ".bin"
 
-class MMapIndexedDataset(torch.utils.data.Dataset):
-    class Index(object):
-        _HDR_MAGIC = b"MMIDIDX\x00\x00"
+def data_file_path(prefix_path: str | Path) -> Path:
+    """Return the token-data path for a binidx prefix."""
+    return Path(f"{prefix_path}.bin")
+
+
+def _dtype_code(dtype: type[np.generic]) -> int:
+    for code, candidate in _DTYPES.items():
+        if candidate is dtype:
+            return code
+    raise ValueError(f"unsupported binidx dtype: {dtype}")
+
+
+class _IndexWriter:
+    def __init__(self, path: str | Path, dtype: type[np.generic]) -> None:
+        self.path = Path(path)
+        self.dtype = dtype
+        self._file = None
+
+    def __enter__(self) -> Self:
+        self._file = self.path.open("wb")
+        self._file.write(MMapIndexedDataset.Index.HEADER_MAGIC)
+        self._file.write(struct.pack("<Q", 1))
+        self._file.write(struct.pack("<B", _dtype_code(self.dtype)))
+        return self
+
+    def write(self, sizes: list[int], document_indices: list[int]) -> None:
+        if self._file is None:
+            raise RuntimeError("binidx index writer is not open")
+        item_size = np.dtype(self.dtype).itemsize
+        pointers = []
+        address = 0
+        for size in sizes:
+            pointers.append(address)
+            address += size * item_size
+        self._file.write(struct.pack("<Q", len(sizes)))
+        self._file.write(struct.pack("<Q", len(document_indices)))
+        self._file.write(np.asarray(sizes, dtype=np.int32).tobytes(order="C"))
+        self._file.write(np.asarray(pointers, dtype=np.int64).tobytes(order="C"))
+        self._file.write(
+            np.asarray(document_indices, dtype=np.int64).tobytes(order="C")
+        )
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        if self._file is not None:
+            self._file.close()
+
+
+class MMapIndexedDataset(Dataset):
+    """Read-only token dataset compatible with the legacy RWKV binidx format."""
+
+    class Index:
+        HEADER_MAGIC = b"MMIDIDX\x00\x00"
 
         @classmethod
-        def writer(cls, path, dtype):
-            class _Writer(object):
-                def __enter__(self):
-                    self._file = open(path, "wb")
+        def writer(
+            cls,
+            path: str | Path,
+            dtype: type[np.generic],
+        ) -> _IndexWriter:
+            del cls
+            return _IndexWriter(path, dtype)
 
-                    # Write Magic string so we can check the file format then opening it again.
-                    self._file.write(cls._HDR_MAGIC)
-                    # Write version number
-                    # Little endian unsigned 64 Bit integer
-                    self._file.write(struct.pack("<Q", 1))
-                    # Little endian unsigned 8 Bit integer
-                    self._file.write(struct.pack("<B", code(dtype)))
-
-                    return self
-
-                @staticmethod
-                def _get_pointers(sizes):
-                    dtype_size = dtype().itemsize
-                    address = 0
-                    pointers = []
-
-                    for size in sizes:
-                        pointers.append(address)
-                        address += size * dtype_size
-
-                    return pointers
-
-                def write(self, sizes, doc_idx):
-                    pointers = self._get_pointers(sizes)
-
-                    # Little endian unsigned 64 Bit integer
-                    self._file.write(struct.pack("<Q", len(sizes)))
-                    # Little endian unsigned 64 Bit integer
-                    self._file.write(struct.pack("<Q", len(doc_idx)))
-
-                    sizes = np.array(sizes, dtype=np.int32)
-                    self._file.write(sizes.tobytes(order="C"))
-                    del sizes
-
-                    pointers = np.array(pointers, dtype=np.int64)
-                    self._file.write(pointers.tobytes(order="C"))
-                    del pointers
-
-                    doc_idx = np.array(doc_idx, dtype=np.int64)
-                    self._file.write(doc_idx.tobytes(order="C"))
-
-                def __exit__(self, exc_type, exc_val, exc_tb):
-                    self._file.close()
-
-            return _Writer()
-        
-        def __init__(self, path, skip_warmup=True):
-            with open(path, "rb") as stream:
-                magic_test = stream.read(9)
-                assert self._HDR_MAGIC == magic_test, (
-                    "Index file doesn't match expected format. "
-                    "Make sure that --dataset-impl is configured properly."
-                )
-                # Little endian unsigned 64 Bit integer
-                version = struct.unpack("<Q", stream.read(8))
-                assert (1,) == version
-
-                # Little endian unsigned 8 Bit integer
-                (dtype_code,) = struct.unpack("<B", stream.read(1))
-                self._dtype = dtypes[dtype_code]
-                self._dtype_size = self._dtype().itemsize
-
-                self._len = struct.unpack("<Q", stream.read(8))[0]
-                self._doc_count = struct.unpack("<Q", stream.read(8))[0]
+        def __init__(self, path: str | Path) -> None:
+            self.path = Path(path)
+            with self.path.open("rb") as stream:
+                if stream.read(9) != self.HEADER_MAGIC:
+                    raise ValueError(f"invalid binidx header: {self.path}")
+                version = struct.unpack("<Q", stream.read(8))[0]
+                if version != 1:
+                    raise ValueError(f"unsupported binidx version: {version}")
+                dtype_code = struct.unpack("<B", stream.read(1))[0]
+                try:
+                    self.dtype = _DTYPES[dtype_code]
+                except KeyError as error:
+                    raise ValueError(
+                        f"unsupported binidx dtype code: {dtype_code}"
+                    ) from error
+                self.length = struct.unpack("<Q", stream.read(8))[0]
+                document_count = struct.unpack("<Q", stream.read(8))[0]
                 offset = stream.tell()
 
-            if not skip_warmup:
-                print_rank_0("    warming up index mmap file...")
-                _warmup_mmap_file(path)
-
-            self._bin_buffer_mmap = np.memmap(path, mode="r", order="C")
-            self._bin_buffer = memoryview(self._bin_buffer_mmap)
-            print_rank_0("    reading sizes...")
-            self._sizes = np.frombuffer(
-                self._bin_buffer, dtype=np.int32, count=self._len, offset=offset
+            self._mmap = np.memmap(self.path, mode="r", order="C")
+            self._buffer = memoryview(self._mmap)
+            self.sizes = np.frombuffer(
+                self._buffer,
+                dtype=np.int32,
+                count=self.length,
+                offset=offset,
             )
-            print_rank_0("    reading pointers...")
-            self._pointers = np.frombuffer(
-                self._bin_buffer,
+            self.pointers = np.frombuffer(
+                self._buffer,
                 dtype=np.int64,
-                count=self._len,
-                offset=offset + self._sizes.nbytes,
+                count=self.length,
+                offset=offset + self.sizes.nbytes,
             )
-            print_rank_0("    reading document index...")
-            self._doc_idx = np.frombuffer(
-                self._bin_buffer,
+            self.document_indices = np.frombuffer(
+                self._buffer,
                 dtype=np.int64,
-                count=self._doc_count,
-                offset=offset + self._sizes.nbytes + self._pointers.nbytes,
+                count=document_count,
+                offset=offset + self.sizes.nbytes + self.pointers.nbytes,
             )
 
-        def __del__(self):
-            self._bin_buffer_mmap._mmap.close()
-            del self._bin_buffer_mmap
+        def close(self) -> None:
+            self._buffer.release()
+            self._mmap._mmap.close()
 
-        @property
-        def dtype(self):
-            return self._dtype
+        def __getitem__(self, index: int) -> tuple[int, int]:
+            return int(self.pointers[index]), int(self.sizes[index])
 
-        @property
-        def sizes(self):
-            return self._sizes
+        def __len__(self) -> int:
+            return self.length
 
-        @property
-        def doc_idx(self):
-            return self._doc_idx
-
-        @lru_cache(maxsize=8)
-        def __getitem__(self, i):
-            return self._pointers[i], self._sizes[i]
-
-        def __len__(self):
-            return self._len
-
-    def __init__(self, path, skip_warmup=True):
+    def __init__(self, path: str | Path) -> None:
         super().__init__()
+        self.path = Path(path)
+        if not self.exists(self.path):
+            raise FileNotFoundError(
+                f"binidx dataset requires {data_file_path(self.path)} and "
+                f"{index_file_path(self.path)}"
+            )
+        self.index = self.Index(index_file_path(self.path))
+        self._mmap = np.memmap(data_file_path(self.path), mode="r", order="C")
+        self._buffer = memoryview(self._mmap)
 
-        self._path = None
-        self._index = None
-        self._bin_buffer = None
+    def close(self) -> None:
+        self._buffer.release()
+        self._mmap._mmap.close()
+        self.index.close()
 
-        self._do_init(path, skip_warmup)
+    def __getstate__(self) -> Path:
+        return self.path
 
-    def __getstate__(self):
-        return self._path
+    def __setstate__(self, path: Path) -> None:
+        self.__init__(path)
 
-    def __setstate__(self, state):
-        self._do_init(state)
+    def __len__(self) -> int:
+        return len(self.index)
 
-    def _do_init(self, path, skip_warmup=True):
-        self._path = path
-        self._index = self.Index(index_file_path(self._path), skip_warmup)
-
-        if not skip_warmup:
-            print_rank_0("    warming up data mmap file...")
-            _warmup_mmap_file(data_file_path(self._path))
-        print_rank_0("    creating numpy buffer of mmap...")
-        self._bin_buffer_mmap = np.memmap(
-            data_file_path(self._path), mode="r", order="C"
+    def __getitem__(self, index: int | slice) -> np.ndarray | list[np.ndarray]:
+        if isinstance(index, int):
+            pointer, size = self.index[index]
+            return np.frombuffer(
+                self._buffer,
+                dtype=self.index.dtype,
+                count=size,
+                offset=pointer,
+            )
+        start, stop, step = index.indices(len(self))
+        if step != 1:
+            raise ValueError("binidx slices must be contiguous")
+        if start == stop:
+            return []
+        pointer = int(self.index.pointers[start])
+        sizes = self.index.sizes[index]
+        offsets = list(accumulate(int(size) for size in sizes))
+        values = np.frombuffer(
+            self._buffer,
+            dtype=self.index.dtype,
+            count=sum(int(size) for size in sizes),
+            offset=pointer,
         )
-        print_rank_0("    creating memory view of numpy buffer...")
-        self._bin_buffer = memoryview(self._bin_buffer_mmap)
+        return list(np.split(values, offsets[:-1]))
 
-    def __del__(self):
-        self._bin_buffer_mmap._mmap.close()
-        del self._bin_buffer_mmap
-        del self._index
-
-    def __len__(self):
-        return len(self._index)
-
-    # @lru_cache(maxsize=8)
-    def __getitem__(self, idx):
-        if isinstance(idx, int):
-            ptr, size = self._index[idx]
-            np_array = np.frombuffer(
-                self._bin_buffer, dtype=self._index.dtype, count=size, offset=ptr
-            )
-            return np_array
-        elif isinstance(idx, slice):
-            start, stop, step = idx.indices(len(self))
-            if step != 1:
-                raise ValueError(
-                    "Slices into indexed_dataset must be contiguous")
-            ptr = self._index._pointers[start]
-            sizes = self._index._sizes[idx]
-            offsets = list(accumulate(sizes))
-            total_size = sum(sizes)
-            np_array = np.frombuffer(
-                self._bin_buffer, dtype=self._index.dtype, count=total_size, offset=ptr
-            )
-            sents = np.split(np_array, offsets[:-1])
-            return sents
-
-    def get(self, idx, offset=0, length=None):
-        """Retrieves a single item from the dataset with the option to only
-        return a portion of the item.
-
-        get(idx) is the same as [idx] but get() does not support slicing.
-        """
-        ptr, size = self._index[idx]
+    def get(
+        self, index: int, *, offset: int = 0, length: int | None = None
+    ) -> np.ndarray:
+        """Read a contiguous token range from one indexed item."""
+        pointer, size = self.index[index]
+        if offset < 0 or offset > size:
+            raise IndexError(f"binidx offset {offset} is outside item of size {size}")
         if length is None:
             length = size - offset
-        ptr += offset * np.dtype(self._index.dtype).itemsize
-        np_array = np.frombuffer(
-            self._bin_buffer, dtype=self._index.dtype, count=length, offset=ptr
+        if length < 0 or offset + length > size:
+            raise IndexError(
+                f"binidx range [{offset}, {offset + length}) exceeds item size {size}"
+            )
+        pointer += offset * np.dtype(self.index.dtype).itemsize
+        return np.frombuffer(
+            self._buffer,
+            dtype=self.index.dtype,
+            count=length,
+            offset=pointer,
         )
-        return np_array
 
     @property
-    def sizes(self):
-        return self._index.sizes
+    def item_sizes(self) -> np.ndarray:
+        return self.index.sizes
 
     @property
-    def doc_idx(self):
-        return self._index.doc_idx
-
-    def get_doc_idx(self):
-        return self._index._doc_idx
-
-    def set_doc_idx(self, doc_idx_):
-        self._index._doc_idx = doc_idx_
-
-    @property
-    def supports_prefetch(self):
-        return False
+    def document_indices(self) -> np.ndarray:
+        return self.index.document_indices
 
     @staticmethod
-    def exists(path):
-        return os.path.exists(index_file_path(path)) and os.path.exists(
-            data_file_path(path)
-        )
+    def exists(path: str | Path) -> bool:
+        return index_file_path(path).is_file() and data_file_path(path).is_file()
+
+
+__all__ = ["MMapIndexedDataset", "data_file_path", "index_file_path"]

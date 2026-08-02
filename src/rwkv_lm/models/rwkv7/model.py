@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any
 
 import torch
@@ -13,7 +15,84 @@ from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import GroupNorm, Identity, LayerNorm
 from torchtitan.protocols import BaseModel
-from torchtitan.protocols.module import Module
+from torchtitan.protocols.module import Module, ModuleDict
+
+
+@dataclass(frozen=True, slots=True)
+class _Rwkv7Runtime:
+    chunk_rwkv7: Callable[..., tuple[torch.Tensor, torch.Tensor]]
+    get_last_provider: Callable[[], str]
+
+
+_RWKV7_RUNTIME: _Rwkv7Runtime | None = None
+
+
+def initialize_rwkv7_runtime() -> None:
+    """Validate and bind the pinned public FLA/FlashRWKV runtime once."""
+    global _RWKV7_RUNTIME
+    if _RWKV7_RUNTIME is not None:
+        return
+
+    from transformers.models.rwkv7 import validate_rwkv7_runtime_provenance
+
+    validate_rwkv7_runtime_provenance()
+
+    from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider
+
+    if not callable(chunk_rwkv7) or not callable(get_last_rwkv7_provider):
+        raise TypeError(
+            "FLA must expose public chunk_rwkv7 and get_last_rwkv7_provider callables"
+        )
+    _RWKV7_RUNTIME = _Rwkv7Runtime(
+        chunk_rwkv7=chunk_rwkv7,
+        get_last_provider=get_last_rwkv7_provider,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Rwkv7RecurrentState:
+    """Per-layer recurrent state carried across RWKV-7 chunks."""
+
+    attention_shift: torch.Tensor
+    wkv: torch.Tensor
+    ffn_shift: torch.Tensor
+
+    def detached(self) -> Rwkv7RecurrentState:
+        """Stop gradients through recurrence while preserving future-token gradients."""
+        return Rwkv7RecurrentState(
+            attention_shift=self.attention_shift.detach(),
+            wkv=self.wkv.detach(),
+            ffn_shift=self.ffn_shift.detach(),
+        )
+
+    def reset_rows(self, reset_mask: torch.Tensor) -> Rwkv7RecurrentState:
+        """Reset selected batch rows without modifying continuing requests."""
+        if reset_mask.ndim != 1 or reset_mask.dtype != torch.bool:
+            raise ValueError("RWKV reset mask must be a rank-one boolean tensor")
+
+        def reset(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.shape[1] != reset_mask.shape[0]:
+                raise ValueError("RWKV reset mask batch size does not match state")
+            shape = (1, reset_mask.shape[0], *((1,) * (tensor.ndim - 2)))
+            return torch.where(
+                reset_mask.view(shape),
+                torch.zeros((), dtype=tensor.dtype, device=tensor.device),
+                tensor,
+            )
+
+        return Rwkv7RecurrentState(
+            attention_shift=reset(self.attention_shift),
+            wkv=reset(self.wkv),
+            ffn_shift=reset(self.ffn_shift),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Rwkv7ModelOutput:
+    """Logits and the final state for explicit recurrent inference/chunking."""
+
+    logits: torch.Tensor
+    state: Rwkv7RecurrentState
 
 
 def _normal_parameter(parameter: nn.Parameter) -> None:
@@ -58,7 +137,6 @@ class Rwkv7TimeMix(Module):
         layer_id: int
         hidden_size: int
         head_size: int
-        wkv_backend: str
         w1: Linear.Config
         w2: Linear.Config
         a1: Linear.Config
@@ -82,7 +160,6 @@ class Rwkv7TimeMix(Module):
         self.hidden_size = hidden_size
         self.head_size = config.head_size
         self.num_heads = num_heads
-        self.wkv_backend = config.wkv_backend
         for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"):
             setattr(self, name, nn.Parameter(torch.empty(1, 1, hidden_size)))
         self.w0 = nn.Parameter(torch.empty(1, 1, hidden_size))
@@ -115,9 +192,6 @@ class Rwkv7TimeMix(Module):
         previous_hidden_state: torch.Tensor,
         wkv_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.wkv_backend != "flash_rwkv":
-            raise RuntimeError("RWKV-7 training requires the FlashRWKV provider")
-
         batch_size, sequence_length, hidden_size = hidden_states.shape
         shifted = torch.cat(
             (previous_hidden_state[:, None], hidden_states[:, :-1]),
@@ -152,7 +226,12 @@ class Rwkv7TimeMix(Module):
         ).view(batch_size, sequence_length, hidden_size)
         key = key * (1 + (learning_rate - 1) * self.k_a)
 
-        from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider
+        runtime = _RWKV7_RUNTIME
+        if runtime is None:
+            raise RuntimeError(
+                "RWKV-7 runtime is not initialized; canonical training must run "
+                "model Config.update_from_config before the first forward"
+            )
 
         kernel_inputs = [
             tensor.view(
@@ -171,7 +250,7 @@ class Rwkv7TimeMix(Module):
             )
         ]
         kernel_inputs[1] = (-F.softplus(-kernel_inputs[1]) - 0.5).contiguous()
-        output, final_wkv_state = chunk_rwkv7(
+        output, final_wkv_state = runtime.chunk_rwkv7(
             *kernel_inputs,
             initial_state=wkv_state,
             output_final_state=True,
@@ -179,7 +258,7 @@ class Rwkv7TimeMix(Module):
             state_indices=None,
             mode="fp32io16",
         )
-        if get_last_rwkv7_provider() != "flash_rwkv":
+        if runtime.get_last_provider() != "flash_rwkv":
             raise RuntimeError(
                 "FLA public chunk_rwkv7 did not select FlashRWKV; fallback is disabled"
             )
@@ -314,10 +393,24 @@ class Rwkv7Model(BaseModel):
         lm_head: Linear.Config
         layer_norm_epsilon: float = 1e-5
         group_norm_epsilon: float = 64e-5
-        wkv_backend: str = "flash_rwkv"
+        recurrent_chunk_size: int | None = None
+        detach_state_between_chunks: bool = False
 
         def update_from_config(self, *, config: Any, **kwargs: Any) -> None:
+            initialize_rwkv7_runtime()
+            from .state_dict_adapter import validate_rwkv7_hf_checkpoint
+
+            validate_rwkv7_hf_checkpoint(config)
             self.context_length = config.training.seq_len
+            if self.recurrent_chunk_size is not None and (
+                self.recurrent_chunk_size <= 0
+                or self.recurrent_chunk_size >= self.context_length
+                or self.recurrent_chunk_size % 16 != 0
+            ):
+                raise ValueError(
+                    "RWKV recurrent_chunk_size must be positive, shorter than "
+                    "training.seq_len, and divisible by 16"
+                )
             from .sharding import set_rwkv7_sharding_config
 
             set_rwkv7_sharding_config(
@@ -339,7 +432,7 @@ class Rwkv7Model(BaseModel):
         self.config = config
         self.enable_weight_tying = False
         self.tok_embeddings = config.tok_embeddings.build()
-        self.layers = nn.ModuleDict(
+        self.layers = ModuleDict(
             {
                 str(layer_index): layer_config.build()
                 for layer_index, layer_config in enumerate(config.layers)
@@ -356,17 +449,17 @@ class Rwkv7Model(BaseModel):
         batch_size: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Rwkv7RecurrentState:
         num_heads = self.config.hidden_size // self.config.head_size
-        return (
-            torch.zeros(
+        return Rwkv7RecurrentState(
+            attention_shift=torch.zeros(
                 self.config.num_hidden_layers,
                 batch_size,
                 self.config.hidden_size,
                 dtype=dtype,
                 device=device,
             ),
-            torch.zeros(
+            wkv=torch.zeros(
                 self.config.num_hidden_layers,
                 batch_size,
                 num_heads,
@@ -375,7 +468,7 @@ class Rwkv7Model(BaseModel):
                 dtype=torch.float32,
                 device=device,
             ),
-            torch.zeros(
+            ffn_shift=torch.zeros(
                 self.config.num_hidden_layers,
                 batch_size,
                 self.config.hidden_size,
@@ -384,30 +477,186 @@ class Rwkv7Model(BaseModel):
             ),
         )
 
+    def _validate_state(
+        self,
+        state: Rwkv7RecurrentState,
+        *,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        num_heads = self.config.hidden_size // self.config.head_size
+        expected_shapes = {
+            "attention_shift": (
+                self.config.num_hidden_layers,
+                batch_size,
+                self.config.hidden_size,
+            ),
+            "wkv": (
+                self.config.num_hidden_layers,
+                batch_size,
+                num_heads,
+                self.config.head_size,
+                self.config.head_size,
+            ),
+            "ffn_shift": (
+                self.config.num_hidden_layers,
+                batch_size,
+                self.config.hidden_size,
+            ),
+        }
+        for name, expected_shape in expected_shapes.items():
+            tensor = getattr(state, name)
+            if tensor.shape != expected_shape:
+                raise ValueError(
+                    f"RWKV {name} state has shape {tuple(tensor.shape)}, "
+                    f"expected {expected_shape}"
+                )
+            if tensor.device != device:
+                raise ValueError(f"RWKV {name} state must be on {device}")
+        if state.attention_shift.dtype != dtype or state.ffn_shift.dtype != dtype:
+            raise ValueError(f"RWKV shift state must use activation dtype {dtype}")
+        if state.wkv.dtype != torch.float32:
+            raise ValueError("RWKV WKV state must use torch.float32")
+
+    def _forward_chunk(
+        self,
+        hidden_states: torch.Tensor,
+        state: Rwkv7RecurrentState,
+    ) -> tuple[torch.Tensor, Rwkv7RecurrentState]:
+        v_first = torch.zeros_like(hidden_states)
+        attention_shift = []
+        wkv = []
+        ffn_shift = []
+        for layer_index, block in enumerate(self.layers.values()):
+            hidden_states, v_first, next_att, next_wkv, next_ffn = block(
+                hidden_states,
+                v_first,
+                state.attention_shift[layer_index],
+                state.wkv[layer_index],
+                state.ffn_shift[layer_index],
+            )
+            attention_shift.append(next_att)
+            wkv.append(next_wkv)
+            ffn_shift.append(next_ffn)
+        return hidden_states, Rwkv7RecurrentState(
+            attention_shift=torch.stack(attention_shift),
+            wkv=torch.stack(wkv),
+            ffn_shift=torch.stack(ffn_shift),
+        )
+
+    @staticmethod
+    def _validate_positions(tokens: torch.Tensor, positions: torch.Tensor) -> None:
+        if positions.shape != tokens.shape:
+            raise ValueError(
+                f"RWKV positions shape {tuple(positions.shape)} must match "
+                f"tokens shape {tuple(tokens.shape)}"
+            )
+        if positions.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise TypeError("RWKV positions must use an integer dtype")
+        if positions.device != tokens.device:
+            raise ValueError("RWKV positions and tokens must be on the same device")
+
+    @staticmethod
+    def _segment_boundaries(
+        *,
+        sequence_length: int,
+        chunk_size: int | None,
+    ) -> list[int]:
+        boundaries = {0, sequence_length}
+        if chunk_size is not None:
+            boundaries.update(range(chunk_size, sequence_length, chunk_size))
+        return sorted(boundaries)
+
     def forward(
         self,
         tokens: torch.Tensor,
         *,
-        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
+        positions: torch.Tensor | None = None,
+        state: Rwkv7RecurrentState
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
+        reset_state: bool = False,
+        reset_mask: torch.Tensor | None = None,
+        chunk_size: int | None = None,
+        detach_state_between_chunks: bool | None = None,
+        return_state: bool = False,
+        **extra_kwargs: Any,
+    ) -> torch.Tensor | Rwkv7ModelOutput:
+        if extra_kwargs:
+            raise TypeError(f"unsupported RWKV model inputs: {sorted(extra_kwargs)}")
+        if tokens.ndim != 2 or tokens.shape[1] == 0:
+            raise ValueError("RWKV tokens must have shape [batch, non-empty sequence]")
+        if positions is not None:
+            self._validate_positions(tokens, positions)
+        if state is not None and not isinstance(state, Rwkv7RecurrentState):
+            if len(state) != 3:
+                raise ValueError(
+                    "RWKV recurrent state tuple must contain three tensors"
+                )
+            state = Rwkv7RecurrentState(*state)
+
         hidden_states = self.tok_embeddings(tokens)
+        if reset_state:
+            state = None
         if state is None:
             state = self._initial_state(
                 hidden_states.shape[0],
                 hidden_states.dtype,
                 hidden_states.device,
             )
+        self._validate_state(
+            state,
+            batch_size=hidden_states.shape[0],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        if reset_mask is not None:
+            if reset_mask.device != hidden_states.device:
+                raise ValueError(
+                    "RWKV reset_mask and tokens must be on the same device"
+                )
+            state = state.reset_rows(reset_mask)
 
-        v_first = torch.zeros_like(hidden_states)
-        for layer_index, block in enumerate(self.layers.values()):
-            hidden_states, v_first, _, _, _ = block(
-                hidden_states,
-                v_first,
-                state[0][layer_index],
-                state[1][layer_index],
-                state[2][layer_index],
+        chunk_size = (
+            self.config.recurrent_chunk_size if chunk_size is None else chunk_size
+        )
+        if chunk_size is not None and (
+            chunk_size <= 0 or chunk_size >= tokens.shape[1] or chunk_size % 16 != 0
+        ):
+            raise ValueError(
+                "RWKV recurrent chunk_size must be positive, shorter than the "
+                "sequence, and divisible by 16"
             )
-        return self.lm_head(self.norm(hidden_states))
+        detach_chunks = (
+            self.config.detach_state_between_chunks
+            if detach_state_between_chunks is None
+            else detach_state_between_chunks
+        )
+        boundaries = self._segment_boundaries(
+            sequence_length=tokens.shape[1],
+            chunk_size=chunk_size,
+        )
+        chunk_outputs = []
+        for segment_index, (start, end) in enumerate(pairwise(boundaries)):
+            chunk_output, state = self._forward_chunk(
+                hidden_states[:, start:end],
+                state,
+            )
+            chunk_outputs.append(chunk_output)
+            if detach_chunks and segment_index + 1 < len(boundaries) - 1:
+                state = state.detached()
+
+        logits = self.lm_head(self.norm(torch.cat(chunk_outputs, dim=1)))
+        if return_state:
+            return Rwkv7ModelOutput(logits=logits, state=state)
+        return logits
 
 
 def build_rwkv7_config(
@@ -420,7 +669,8 @@ def build_rwkv7_config(
     head_size: int,
     layer_norm_epsilon: float = 1e-5,
     group_norm_epsilon: float = 64e-5,
-    wkv_backend: str = "flash_rwkv",
+    recurrent_chunk_size: int | None = None,
+    detach_state_between_chunks: bool = False,
 ) -> Rwkv7Model.Config:
     """Build the declarative TorchTitan config tree for one RWKV-7 flavor."""
     if hidden_size % head_size != 0:
@@ -438,7 +688,8 @@ def build_rwkv7_config(
         head_size=head_size,
         layer_norm_epsilon=layer_norm_epsilon,
         group_norm_epsilon=group_norm_epsilon,
-        wkv_backend=wkv_backend,
+        recurrent_chunk_size=recurrent_chunk_size,
+        detach_state_between_chunks=detach_state_between_chunks,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=hidden_size,
@@ -468,7 +719,6 @@ def build_rwkv7_config(
             layer_id=layer_id,
             hidden_size=hidden_size,
             head_size=head_size,
-            wkv_backend=wkv_backend,
             param_init={name: _zero_parameter for name in direct_parameter_names},
             w1=_linear_config(hidden_size, decay_rank, zero=True),
             w2=_linear_config(decay_rank, hidden_size, zero=True),
@@ -523,6 +773,9 @@ __all__ = [
     "Rwkv7Block",
     "Rwkv7ChannelMix",
     "Rwkv7Model",
+    "Rwkv7ModelOutput",
+    "Rwkv7RecurrentState",
     "Rwkv7TimeMix",
     "build_rwkv7_config",
+    "initialize_rwkv7_runtime",
 ]

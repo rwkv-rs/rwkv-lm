@@ -54,7 +54,7 @@ def set_rwkv7_sharding_config(
     activation = dense_activation_placement(tp=spmd.I, cp=spmd.I)
     recurrent_state = dense_activation_placement(tp=spmd.I, cp=spmd.I)
     config.sharding_config = ShardingConfig(
-        in_src_shardings={"tokens": activation},
+        in_src_shardings={"tokens": activation, "positions": activation},
         out_src_shardings=activation,
     )
     config.tok_embeddings.sharding_config = ShardingConfig(

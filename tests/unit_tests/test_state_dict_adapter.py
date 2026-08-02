@@ -26,6 +26,18 @@ def test_transformers_state_dict_names_round_trip() -> None:
     assert adapter.from_hf(hf) == native
 
 
+def test_full_69_key_model_state_round_trips_without_loss() -> None:
+    model = model_registry("debugmodel").model.build()
+    model.init_states()
+    adapter = Rwkv7StateDictAdapter(model_registry("debugmodel").model, None)
+    native = model.state_dict()
+
+    assert len(native) == 69
+    restored = adapter.from_hf(adapter.to_hf(native))
+    assert restored.keys() == native.keys()
+    assert all(torch.equal(restored[name], native[name]) for name in native)
+
+
 def test_unknown_state_dict_name_fails_closed() -> None:
     adapter = Rwkv7StateDictAdapter(model_registry("debugmodel").model, None)
 
@@ -62,3 +74,37 @@ def test_lora_state_exports_as_merged_transformers_weight() -> None:
         expected,
     )
     assert not any("lora_" in name for name in hf_state)
+
+
+def test_lora_adapter_only_state_loads_and_preserves_inference() -> None:
+    spec = model_registry(
+        "debugmodel",
+        converters=[
+            LoRAConverter.Config(
+                rank=2,
+                alpha=4.0,
+                target_modules=["receptance"],
+            )
+        ],
+    )
+    source = spec.model.build()
+    source.init_states()
+    target = spec.model.build()
+    target.init_states()
+    adapter = Rwkv7StateDictAdapter(spec.model, None)
+    with torch.no_grad():
+        source.layers["0"].att.receptance.lora_a.weight.fill_(0.25)
+        source.layers["0"].att.receptance.lora_b.weight.fill_(0.5)
+        target.load_state_dict(source.state_dict(), strict=True)
+        target.layers["0"].att.receptance.lora_a.weight.zero_()
+        target.layers["0"].att.receptance.lora_b.weight.zero_()
+    adapter_state = adapter.adapter_state_dict(source.state_dict())
+    adapter.load_adapter_state_dict(target, adapter_state)
+    inputs = torch.randn(2, 3, spec.model.hidden_size)
+
+    assert adapter_state
+    assert all(".lora_" in name for name in adapter_state)
+    assert torch.equal(
+        source.layers["0"].att.receptance(inputs),
+        target.layers["0"].att.receptance(inputs),
+    )

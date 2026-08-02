@@ -12,7 +12,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
-from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh
+from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh, validate_config
 
 from .model import Rwkv7Model
 
@@ -30,6 +30,10 @@ def parallelize_rwkv7(
     """Apply activation checkpointing, compile, then FSDP in TorchTitan order."""
     if parallel_dims.tp_enabled or parallel_dims.cp_enabled:
         raise ValueError("RWKV-7 currently supports TorchTitan data parallelism only")
+
+    if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+        validate_config(parallel_dims, model)
+        model.parallelize(parallel_dims)
 
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)
