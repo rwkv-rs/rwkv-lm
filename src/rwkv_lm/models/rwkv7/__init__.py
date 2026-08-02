@@ -13,11 +13,9 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .dataloader import RwkvDataLoader
 from .model import Rwkv7Block, Rwkv7ChannelMix, Rwkv7Model, Rwkv7TimeMix
 from .parallelize import parallelize_rwkv7
 from .state_dict_adapter import Rwkv7StateDictAdapter
-from .tokenizer import RwkvPretokenizedTokenizer
 
 _LINEAR_INIT = {
     "weight": partial(nn.init.normal_, mean=0.0, std=0.02),
@@ -211,8 +209,6 @@ def model_registry(
 
 __all__ = [
     "Rwkv7Model",
-    "RwkvDataLoader",
-    "RwkvPretokenizedTokenizer",
     "model_registry",
     "parallelize_rwkv7",
     "rwkv7_configs",

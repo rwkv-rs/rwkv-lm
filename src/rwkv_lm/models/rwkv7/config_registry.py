@@ -10,9 +10,10 @@ from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.trainer import Trainer
 
+from rwkv_lm.components.tokenizer import RwkvPretokenizedTokenizer
+from rwkv_lm.datasets.dataloader import RwkvDataLoader
+
 from . import model_registry
-from .dataloader import RwkvDataLoader
-from .tokenizer import RwkvPretokenizedTokenizer
 
 
 def _training_config(

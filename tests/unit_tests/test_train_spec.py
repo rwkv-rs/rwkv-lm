@@ -8,13 +8,13 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
 from torchtitan.trainer import Trainer
 
+from rwkv_lm.datasets.dataloader import RwkvDataLoader
 from rwkv_lm.models.rwkv7 import model as model_module
 from rwkv_lm.models.rwkv7 import model_registry
 from rwkv_lm.models.rwkv7.config_registry import (
     rwkv7_1_5b,
     rwkv7_debugmodel,
 )
-from rwkv_lm.models.rwkv7.dataloader import RwkvDataLoader
 from rwkv_lm.models.rwkv7.state_dict_adapter import AdapterCheckpointError
 
 

@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import shutil
 import subprocess
 import tarfile
@@ -55,17 +56,32 @@ def test_duplicate_generic_training_stack_is_removed() -> None:
     assert not list(ROOT.glob("demo-training-run*.sh"))
 
 
-def test_rwkv7_specific_extensions_share_the_model_owner() -> None:
+def test_rwkv7_data_and_tokenizer_have_independent_owners() -> None:
     package = ROOT / "src" / "rwkv_lm"
-    model_package = package / "models" / "rwkv7"
+    model_directory = package / "models" / "rwkv7"
 
-    assert (model_package / "tokenizer.py").is_file()
-    assert (model_package / "binidx.py").is_file()
-    assert (model_package / "dataloader.py").is_file()
-    assert not (package / "components" / "tokenizer.py").exists()
-    assert not (package / "datasets" / "binidx.py").exists()
-    assert not (package / "datasets" / "dataloader.py").exists()
+    assert (package / "components" / "tokenizer.py").is_file()
+    assert (package / "datasets" / "binidx.py").is_file()
+    assert (package / "datasets" / "dataloader.py").is_file()
+    assert {path.name for path in model_directory.glob("*.py")} == {
+        "__init__.py",
+        "config_registry.py",
+        "model.py",
+        "parallelize.py",
+        "sharding.py",
+        "state_dict_adapter.py",
+    }
     assert not (package / "binidx.py").exists()
+
+    tokenizer_module = importlib.import_module("rwkv_lm.components.tokenizer")
+    binidx_module = importlib.import_module("rwkv_lm.datasets.binidx")
+    dataloader_module = importlib.import_module("rwkv_lm.datasets.dataloader")
+    model_module = importlib.import_module("rwkv_lm.models.rwkv7")
+    assert tokenizer_module.RwkvPretokenizedTokenizer
+    assert binidx_module.MMapIndexedDataset
+    assert dataloader_module.RwkvDataLoader
+    assert not hasattr(model_module, "RwkvPretokenizedTokenizer")
+    assert not hasattr(model_module, "RwkvDataLoader")
 
 
 def test_hosted_cpu_contract_installs_public_fla_and_runs_full_unit_suite() -> None:
