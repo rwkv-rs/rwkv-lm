@@ -2,6 +2,7 @@ import hashlib
 import importlib
 import shutil
 import subprocess
+import sys
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -56,13 +57,19 @@ def test_duplicate_generic_training_stack_is_removed() -> None:
     assert not list(ROOT.glob("demo-training-run*.sh"))
 
 
-def test_rwkv7_data_and_tokenizer_have_independent_owners() -> None:
+def test_rwkv7_data_follows_torchtitan_dataset_family_ownership() -> None:
     package = ROOT / "src" / "rwkv_lm"
     model_directory = package / "models" / "rwkv7"
+    dataset_directory = package / "rwkv_datasets"
 
     assert (package / "components" / "tokenizer.py").is_file()
-    assert (package / "datasets" / "binidx.py").is_file()
-    assert (package / "datasets" / "dataloader.py").is_file()
+    assert {path.name for path in dataset_directory.glob("*.py")} == {
+        "binidx_datasets.py",
+        "text_datasets.py",
+    }
+    assert not (package / "components" / "dataloader.py").exists()
+    assert not (package / "datasets" / "binidx.py").exists()
+    assert not (package / "datasets" / "dataloader.py").exists()
     assert {path.name for path in model_directory.glob("*.py")} == {
         "__init__.py",
         "config_registry.py",
@@ -74,14 +81,44 @@ def test_rwkv7_data_and_tokenizer_have_independent_owners() -> None:
     assert not (package / "binidx.py").exists()
 
     tokenizer_module = importlib.import_module("rwkv_lm.components.tokenizer")
-    binidx_module = importlib.import_module("rwkv_lm.datasets.binidx")
-    dataloader_module = importlib.import_module("rwkv_lm.datasets.dataloader")
+    binidx_module = importlib.import_module("rwkv_lm.rwkv_datasets.binidx_datasets")
+    dataloader_module = importlib.import_module("rwkv_lm.rwkv_datasets.text_datasets")
     model_module = importlib.import_module("rwkv_lm.models.rwkv7")
+    state_dict_adapter_module = importlib.import_module(
+        "rwkv_lm.models.rwkv7.state_dict_adapter"
+    )
     assert tokenizer_module.RwkvPretokenizedTokenizer
     assert binidx_module.MMapIndexedDataset
     assert dataloader_module.RwkvDataLoader
     assert not hasattr(model_module, "RwkvPretokenizedTokenizer")
     assert not hasattr(model_module, "RwkvDataLoader")
+    assert not hasattr(state_dict_adapter_module, "AdapterCheckpointError")
+    assert not hasattr(state_dict_adapter_module, "Rwkv7ArtifactIdentity")
+    assert not hasattr(state_dict_adapter_module, "validate_rwkv7_artifact")
+
+
+def test_tokenizer_import_does_not_load_rwkv7_model_package() -> None:
+    script = """
+import sys
+from rwkv_lm.components.tokenizer import RwkvPretokenizedTokenizer
+
+blocked = {
+    "rwkv_lm.models.rwkv7",
+    "rwkv_lm.models.rwkv7.model",
+    "rwkv_lm.models.rwkv7.parallelize",
+    "rwkv_lm.models.rwkv7.state_dict_adapter",
+}
+loaded = sorted(blocked.intersection(sys.modules))
+if loaded:
+    raise RuntimeError(f"tokenizer import loaded RWKV-7 model modules: {loaded}")
+assert RwkvPretokenizedTokenizer
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_hosted_cpu_contract_installs_public_fla_and_runs_full_unit_suite() -> None:

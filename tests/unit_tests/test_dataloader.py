@@ -6,12 +6,12 @@ import torch
 import torch.distributed.checkpoint as dcp
 
 from rwkv_lm.components.tokenizer import RwkvPretokenizedTokenizer
-from rwkv_lm.datasets.binidx import (
+from rwkv_lm.rwkv_datasets.binidx_datasets import (
     MMapIndexedDataset,
     data_file_path,
     index_file_path,
 )
-from rwkv_lm.datasets.dataloader import RwkvDataLoader
+from rwkv_lm.rwkv_datasets.text_datasets import RwkvDataLoader
 
 
 def _tokenizer(

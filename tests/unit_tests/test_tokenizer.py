@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from rwkv_lm.artifacts.rwkv7 import AdapterCheckpointError
 from rwkv_lm.components.tokenizer import RwkvPretokenizedTokenizer
-from rwkv_lm.models.rwkv7.state_dict_adapter import AdapterCheckpointError
 
 
 def _tokenizer(

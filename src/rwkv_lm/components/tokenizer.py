@@ -7,7 +7,7 @@ from typing import Any
 
 from torchtitan.components.tokenizer import BaseTokenizer
 
-from rwkv_lm.models.rwkv7.state_dict_adapter import validate_rwkv7_artifact
+from rwkv_lm.artifacts.rwkv7 import validate_rwkv7_artifact
 
 
 class RwkvPretokenizedTokenizer(BaseTokenizer):

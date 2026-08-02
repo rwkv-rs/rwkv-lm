@@ -7,11 +7,9 @@ import pytest
 import torch
 from torchtitan.components.lora import LoRAConverter
 
+from rwkv_lm.artifacts.rwkv7 import AdapterCheckpointError
 from rwkv_lm.models.rwkv7 import model_registry
-from rwkv_lm.models.rwkv7.state_dict_adapter import (
-    AdapterCheckpointError,
-    Rwkv7StateDictAdapter,
-)
+from rwkv_lm.models.rwkv7.state_dict_adapter import Rwkv7StateDictAdapter
 
 _SOURCE_REVISION = "1" * 40
 _OTHER_REVISION = "2" * 40

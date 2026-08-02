@@ -1,4 +1,4 @@
-"""TorchTitan dataloader for RWKV synthetic and binidx training data."""
+"""TorchTitan dataloader for RWKV synthetic and binidx text data."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import torch
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.tokenizer import BaseTokenizer
 
-from .binidx import MMapIndexedDataset
+from .binidx_datasets import MMapIndexedDataset
 
 
 def _is_prime(value: int) -> bool:

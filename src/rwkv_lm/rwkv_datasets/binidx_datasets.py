@@ -1,4 +1,4 @@
-"""Memory-mapped RWKV ``.bin``/``.idx`` token storage."""
+"""Memory-mapped RWKV ``.bin``/``.idx`` token datasets."""
 
 from __future__ import annotations
 

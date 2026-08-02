@@ -5,7 +5,6 @@ import torch
 from torch.nn import functional as F
 
 from rwkv_lm.components.tokenizer import RwkvPretokenizedTokenizer
-from rwkv_lm.datasets.dataloader import RwkvDataLoader
 from rwkv_lm.models.rwkv7 import model as model_module
 from rwkv_lm.models.rwkv7 import model_registry
 from rwkv_lm.models.rwkv7.config_registry import rwkv7_debugmodel
@@ -15,6 +14,7 @@ from rwkv_lm.models.rwkv7.model import (
     Rwkv7ModelOutput,
     Rwkv7RecurrentState,
 )
+from rwkv_lm.rwkv_datasets.text_datasets import RwkvDataLoader
 
 
 def _model() -> Rwkv7Model:
