@@ -1,4 +1,4 @@
-from rwkv_lm.cli import main
+from rwkv_lm.train import main
 
 if __name__ == "__main__":
     main()

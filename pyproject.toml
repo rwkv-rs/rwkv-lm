@@ -13,13 +13,14 @@ dependencies = [
     "flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@866aafd2eed146b0eda1ce03444009ae030f89e3",
     "numpy>=2.0.0",
     "torch",
+    "torchtitan @ git+https://github.com/pytorch/torchtitan.git@681fd4b509b183ba33f70d39580b848b36e66ca5",
     "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@2696927df9363b5fa175076bb827ba4da2c4e581",
     "wandb",
 ]
 
 [project.scripts]
-rwkv-convert-legacy-checkpoint = "rwkv_lm.standard_model:converter_main"
-rwkv-train = "rwkv_lm.cli:main"
+rwkv-convert-legacy-checkpoint = "rwkv_lm.models.rwkv7.state_dict_adapter:converter_main"
+rwkv-train = "torchtitan.train:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
