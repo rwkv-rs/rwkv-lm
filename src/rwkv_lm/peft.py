@@ -1,4 +1,4 @@
-"""Native LoRA configuration, trainable-state, and artifact contracts."""
+"""RWKV LoRA configuration, trainable-state, and artifact contracts."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ LORA_TARGET_MODULES = (
 )
 _ADAPTER_FORMAT = "rwkv-lora-adapter"
 _ADAPTER_SCHEMA_VERSION = 1
+_CHECKPOINT_WRAPPER_SEGMENT = "._checkpoint_wrapped_module"
 
 
 class PeftContractError(ValueError):
@@ -178,14 +179,16 @@ def validate_lora_trainable_parameters(
     if config.enabled and not adapter_names:
         raise PeftContractError("enabled LoRA did not create adapter parameters")
     unexpected = sorted(
-        name
+        _canonical_parameter_name(name)
         for name, parameter in model.named_parameters()
-        if parameter.requires_grad and name not in adapter_names
+        if parameter.requires_grad
+        and _canonical_parameter_name(name) not in adapter_names
     )
     frozen_adapters = sorted(
-        name
+        _canonical_parameter_name(name)
         for name, parameter in model.named_parameters()
-        if name in adapter_names and not parameter.requires_grad
+        if _canonical_parameter_name(name) in adapter_names
+        and not parameter.requires_grad
     )
     if unexpected:
         raise PeftContractError(
@@ -203,7 +206,7 @@ def lora_parameter_names(model: nn.Module) -> tuple[str, ...]:
 
     return tuple(
         sorted(
-            name
+            _canonical_parameter_name(name)
             for name, _parameter in model.named_parameters()
             if _is_lora_parameter_name(name)
         )
@@ -216,7 +219,7 @@ def lora_adapter_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     names = lora_parameter_names(model)
     if not names:
         raise PeftContractError("cannot serialize an adapter from LoRA-disabled model")
-    parameters = dict(model.named_parameters())
+    parameters = _canonical_parameter_map(model)
     return {
         name: parameters[name].detach().cpu().contiguous().clone() for name in names
     }
@@ -230,11 +233,16 @@ def lora_base_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """
 
     adapter_names = set(lora_parameter_names(model))
-    return {
-        name: tensor
-        for name, tensor in model.state_dict().items()
-        if name not in adapter_names
-    }
+    base_state = {}
+    for name, tensor in model.state_dict().items():
+        canonical_name = _canonical_parameter_name(name)
+        if canonical_name in base_state:
+            raise PeftContractError(
+                f"LoRA base state contains duplicate canonical key: {canonical_name}"
+            )
+        if canonical_name not in adapter_names:
+            base_state[canonical_name] = tensor
+    return base_state
 
 
 def lora_merged_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -266,7 +274,7 @@ def lora_merged_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
                 f"multiple LoRA adapters target one projection: {projection_name}"
             )
         merged_projection_names.add(projection_name)
-        weight_name = f"{projection_name}.weight"
+        weight_name = _canonical_parameter_name(f"{projection_name}.weight")
         if weight_name not in merged_state:
             raise PeftContractError(
                 f"LoRA base state is missing projection weight: {weight_name}"
@@ -431,7 +439,7 @@ def load_lora_adapter(model: nn.Module, path: Path) -> LoraConfig:
             "LoRA adapter tensors do not match the model"
             + (" (" + "; ".join(details) + ")" if details else "")
         )
-    parameters = dict(model.named_parameters())
+    parameters = _canonical_parameter_map(model)
     with torch.no_grad():
         for name in sorted(expected_names):
             source_tensor = state[name]
@@ -494,6 +502,22 @@ def _model_lora_config(model: nn.Module) -> LoraConfig:
 
 def _is_lora_parameter_name(name: str) -> bool:
     return name.endswith((".lora_A", ".lora_B"))
+
+
+def _canonical_parameter_name(name: str) -> str:
+    return name.replace(_CHECKPOINT_WRAPPER_SEGMENT, "")
+
+
+def _canonical_parameter_map(model: nn.Module) -> dict[str, nn.Parameter]:
+    parameters = {}
+    for name, parameter in model.named_parameters():
+        canonical_name = _canonical_parameter_name(name)
+        if canonical_name in parameters:
+            raise PeftContractError(
+                f"LoRA model contains duplicate canonical parameter: {canonical_name}"
+            )
+        parameters[canonical_name] = parameter
+    return parameters
 
 
 def _exact_mapping(

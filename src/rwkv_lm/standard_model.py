@@ -8,6 +8,7 @@ surface that the rwkv-lm training runner needs around that public model.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
@@ -27,10 +29,34 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 
 from .activation_checkpointing import FSDP2ActivationCheckpointing
 from .checkpoint import CheckpointContractError
+from .infctx import (
+    InfctxBoundary,
+    InfctxContractError,
+    InfctxResult,
+    InfctxState,
+    recurrent_chunk_forward,
+)
+from .peft import (
+    LoraConfig,
+    PeftContractError,
+    build_lora_delta,
+    freeze_base_for_lora,
+    load_lora_adapter,
+    lora_merged_state_dict,
+    save_lora_adapter,
+)
 
 _CONFIG_MODULE = "transformers.models.rwkv7.configuration_rwkv7"
 _MODEL_MODULE = "transformers.models.rwkv7.modeling_rwkv7"
 _CONVERTER_MODULE = "transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf"
+_STANDARD_LORA_TARGETS = {
+    "time_mix.receptance": ("att", "receptance"),
+    "time_mix.key": ("att", "key"),
+    "time_mix.value": ("att", "value"),
+    "time_mix.output": ("att", "output"),
+    "channel_mix.key": ("ffn", "key"),
+    "channel_mix.value": ("ffn", "value"),
+}
 
 
 class StandardModelContractError(CheckpointContractError):
@@ -104,7 +130,6 @@ class StandardRwkv7Config:
             "intermediate_size": self.intermediate_size,
             "num_attention_heads": self.hidden_size // self.head_size,
             "num_hidden_layers": self.num_hidden_layers,
-            "pad_token_id": 0,
             "use_cache": True,
             "vocab_size": self.vocab_size,
             "wkv_backend": self.wkv_backend,
@@ -212,6 +237,89 @@ def save_standard_rwkv7_model(model: nn.Module, destination: Path) -> Path:
     return destination
 
 
+def configure_standard_rwkv7_peft(
+    model: nn.Module,
+    config: LoraConfig,
+    *,
+    adapter_path: Path | None = None,
+) -> nn.Module:
+    """Attach the existing RWKV LoRA contract to Transformers projections.
+
+    The public model keeps ownership of every base projection.  Selected LoRA
+    deltas are registered as sibling modules and contribute through projection
+    hooks, so adapter artifacts and merge logic retain their existing canonical
+    parameter names without copying the Transformers implementation.
+    """
+
+    if not isinstance(config, LoraConfig):
+        raise PeftContractError("standard RWKV-7 PEFT requires LoraConfig")
+    if hasattr(model, "_standard_rwkv7_lora_hook_handles"):
+        raise PeftContractError("standard RWKV-7 model already has PEFT configured")
+    setattr(model, "lora_config", config)
+    handles = []
+    if config.enabled:
+        for block_id, block in enumerate(standard_rwkv7_blocks(model)):
+            for target in config.target_modules:
+                owner_name, projection_name = _STANDARD_LORA_TARGETS[target]
+                owner = getattr(block, owner_name, None)
+                projection = getattr(owner, projection_name, None)
+                if not isinstance(projection, nn.Linear):
+                    raise PeftContractError(
+                        "standard RWKV-7 LoRA target is not a linear projection: "
+                        f"model.blocks.{block_id}.{owner_name}.{projection_name}"
+                    )
+                adapter_name = f"{projection_name}_lora"
+                if hasattr(owner, adapter_name):
+                    raise PeftContractError(
+                        "standard RWKV-7 LoRA target is already configured: "
+                        f"model.blocks.{block_id}.{owner_name}.{projection_name}"
+                    )
+                adapter = build_lora_delta(
+                    config,
+                    target,
+                    in_features=projection.in_features,
+                    out_features=projection.out_features,
+                )
+                setattr(owner, adapter_name, adapter)
+                handles.append(
+                    projection.register_forward_hook(
+                        partial(_add_lora_projection_output, adapter=adapter)
+                    )
+                )
+        freeze_base_for_lora(model, config)
+        if adapter_path is not None:
+            load_lora_adapter(model, Path(adapter_path))
+    elif adapter_path is not None:
+        raise PeftContractError(
+            "loading a LoRA adapter requires an enabled standard model"
+        )
+    setattr(model, "_standard_rwkv7_lora_hook_handles", handles)
+    return model
+
+
+def save_standard_rwkv7_lora_adapter(model: nn.Module, path: Path) -> Path:
+    """Save the adapter-only artifact shared with the existing PEFT contract."""
+
+    return save_lora_adapter(model, Path(path))
+
+
+def save_standard_rwkv7_merged_model(
+    model: nn.Module,
+    destination: Path,
+) -> Path:
+    """Merge LoRA deltas into a strict-loadable Transformers model directory."""
+
+    merged_state = lora_merged_state_dict(model)
+    bindings = load_standard_rwkv7_bindings()
+    merged_model = bindings.model_type(copy.deepcopy(model.config))
+    incompatible = merged_model.load_state_dict(merged_state, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise PeftContractError(
+            "merged standard RWKV-7 state did not strict-load into a base model"
+        )
+    return save_standard_rwkv7_model(merged_model, Path(destination))
+
+
 def standard_rwkv7_blocks(model: nn.Module) -> tuple[nn.Module, ...]:
     """Return the Transformers-owned RWKV blocks selected by FSDP2."""
 
@@ -264,21 +372,88 @@ def standard_rwkv7_training_loss(
     model: nn.Module,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
+    *,
+    train_type: str = "standard",
+    chunk_ctx: int = 0,
+    ctx_len: int | None = None,
 ) -> torch.Tensor:
-    """Run the public CausalLM loss path used by both SFT and pretraining."""
+    """Run SFT/pretraining loss with the existing explicit-target dataset."""
 
-    outputs = model(
-        input_ids=input_ids,
-        labels=labels,
-        use_cache=False,
-        return_dict=True,
-    )
-    loss = getattr(outputs, "loss", None)
-    if not isinstance(loss, torch.Tensor) or loss.ndim != 0:
-        raise StandardModelContractError(
-            "standard RWKV-7 forward must return a scalar loss"
+    if train_type == "standard":
+        outputs = model(
+            input_ids=input_ids,
+            use_cache=False,
+            return_dict=True,
         )
-    return loss
+        logits = getattr(outputs, "logits", None)
+    elif train_type == "infctx":
+        if ctx_len is None:
+            raise InfctxContractError("standard RWKV-7 infctx requires ctx_len")
+        logits = standard_rwkv7_infctx_forward(
+            model,
+            input_ids,
+            chunk_ctx=chunk_ctx,
+            ctx_len=ctx_len,
+            boundary=InfctxBoundary.RESET,
+        ).output
+    else:
+        raise StandardModelContractError(
+            f"unsupported standard RWKV-7 train_type: {train_type!r}"
+        )
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
+        raise StandardModelContractError(
+            "standard RWKV-7 forward must return [B, T, vocab] logits"
+        )
+    if labels.shape != input_ids.shape or logits.shape[:2] != labels.shape:
+        raise StandardModelContractError(
+            "standard RWKV-7 labels and logits must preserve the input [B, T] axes"
+        )
+    return F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+
+
+def standard_rwkv7_infctx_forward(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    *,
+    chunk_ctx: int,
+    ctx_len: int,
+    boundary: InfctxBoundary | str,
+    state: InfctxState | None = None,
+) -> InfctxResult:
+    """Run the public Transformers recurrent state through TBPTT boundaries."""
+
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        raise InfctxContractError(
+            "standard RWKV-7 infctx input_ids must have shape [B, T]"
+        )
+    batch_size = input_ids.shape[0]
+    return recurrent_chunk_forward(
+        input_ids,
+        chunk_ctx=chunk_ctx,
+        ctx_len=ctx_len,
+        boundary=boundary,
+        state=state,
+        reset_state=lambda: _reset_standard_rwkv7_infctx_state(
+            model,
+            batch_size=batch_size,
+            device=input_ids.device,
+        ),
+        validate_state=lambda candidate: _validate_standard_rwkv7_infctx_state(
+            model,
+            candidate,
+            batch_size=batch_size,
+            device=input_ids.device,
+        ),
+        forward_chunk=lambda chunk, candidate: _forward_standard_rwkv7_chunk(
+            model,
+            chunk,
+            candidate,
+        ),
+    )
 
 
 def standard_rwkv7_optimizer_groups(
@@ -432,6 +607,187 @@ def _require_standard_model(
         )
 
 
+def _add_lora_projection_output(
+    _projection: nn.Module,
+    inputs: tuple[object, ...],
+    output: torch.Tensor,
+    *,
+    adapter: nn.Module,
+) -> torch.Tensor:
+    if len(inputs) != 1 or not isinstance(inputs[0], torch.Tensor):
+        raise PeftContractError(
+            "standard RWKV-7 LoRA projection must receive one Torch tensor"
+        )
+    if not isinstance(output, torch.Tensor):
+        raise PeftContractError(
+            "standard RWKV-7 LoRA projection must return one Torch tensor"
+        )
+    return output + adapter(inputs[0])
+
+
+def _reset_standard_rwkv7_infctx_state(
+    model: nn.Module,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> InfctxState:
+    config = getattr(model, "config", None)
+    embeddings = getattr(getattr(model, "model", None), "embeddings", None)
+    if not isinstance(embeddings, nn.Embedding):
+        raise InfctxContractError(
+            "standard RWKV-7 infctx requires model.embeddings"
+        )
+    layers = int(getattr(config, "num_hidden_layers", 0))
+    hidden_size = int(getattr(config, "hidden_size", 0))
+    num_heads = int(getattr(config, "num_attention_heads", 0))
+    head_size = int(getattr(config, "head_size", 0))
+    if (
+        layers <= 0
+        or hidden_size <= 0
+        or num_heads <= 0
+        or head_size <= 0
+        or num_heads * head_size != hidden_size
+    ):
+        raise InfctxContractError(
+            "standard RWKV-7 infctx config has an invalid recurrent layout"
+        )
+    return InfctxState(
+        shift_states=torch.zeros(
+            layers,
+            2,
+            batch_size,
+            hidden_size,
+            dtype=_standard_rwkv7_hidden_dtype(model, device),
+            device=device,
+        ),
+        wkv_states=torch.zeros(
+            layers,
+            batch_size,
+            num_heads,
+            head_size,
+            head_size,
+            dtype=torch.float32,
+            device=device,
+        ),
+        tokens_seen=0,
+    )
+
+
+def _validate_standard_rwkv7_infctx_state(
+    model: nn.Module,
+    state: InfctxState,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> None:
+    if not isinstance(state, InfctxState):
+        raise InfctxContractError(
+            "standard RWKV-7 recurrent state must be InfctxState"
+        )
+    config = model.config
+    embeddings = getattr(getattr(model, "model", None), "embeddings", None)
+    if not isinstance(embeddings, nn.Embedding):
+        raise InfctxContractError(
+            "standard RWKV-7 infctx requires model.embeddings"
+        )
+    expected_shift = (
+        int(config.num_hidden_layers),
+        2,
+        batch_size,
+        int(config.hidden_size),
+    )
+    expected_wkv = (
+        int(config.num_hidden_layers),
+        batch_size,
+        int(config.num_attention_heads),
+        int(config.head_size),
+        int(config.head_size),
+    )
+    if tuple(state.shift_states.shape) != expected_shift:
+        raise InfctxContractError(
+            "standard RWKV-7 infctx shift state shape is invalid"
+        )
+    if tuple(state.wkv_states.shape) != expected_wkv:
+        raise InfctxContractError(
+            "standard RWKV-7 infctx WKV state shape is invalid"
+        )
+    if state.shift_states.device != device or state.wkv_states.device != device:
+        raise InfctxContractError(
+            "standard RWKV-7 infctx state must be on the input device"
+        )
+    if state.shift_states.dtype != _standard_rwkv7_hidden_dtype(model, device):
+        raise InfctxContractError(
+            "standard RWKV-7 infctx shift state dtype must match embeddings"
+        )
+    if state.wkv_states.dtype != torch.float32:
+        raise InfctxContractError(
+            "standard RWKV-7 infctx WKV state must use FP32"
+        )
+    if not state.shift_states.is_contiguous() or not state.wkv_states.is_contiguous():
+        raise InfctxContractError(
+            "standard RWKV-7 infctx state must be contiguous"
+        )
+
+
+def _forward_standard_rwkv7_chunk(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    state: InfctxState,
+) -> InfctxResult:
+    provider_state = (
+        state.shift_states[:, 0],
+        state.wkv_states,
+        state.shift_states[:, 1],
+    )
+    outputs = model(
+        input_ids=input_ids,
+        state=provider_state,
+        use_cache=True,
+        return_dict=True,
+    )
+    logits = getattr(outputs, "logits", None)
+    next_state = getattr(outputs, "state", None)
+    if not isinstance(logits, torch.Tensor):
+        raise InfctxContractError(
+            "standard RWKV-7 infctx forward must return logits"
+        )
+    if (
+        not isinstance(next_state, (tuple, list))
+        or len(next_state) != 3
+        or any(not isinstance(value, torch.Tensor) for value in next_state)
+    ):
+        raise InfctxContractError(
+            "standard RWKV-7 infctx forward must return attention, WKV, and "
+            "FFN state tensors"
+        )
+    attention_shift, wkv_state, ffn_shift = next_state
+    return InfctxResult(
+        output=logits,
+        state=InfctxState(
+            shift_states=torch.stack(
+                (attention_shift, ffn_shift),
+                dim=1,
+            ).contiguous(),
+            wkv_states=wkv_state.contiguous(),
+            tokens_seen=state.tokens_seen + input_ids.shape[1],
+        ),
+    )
+
+
+def _standard_rwkv7_hidden_dtype(
+    model: nn.Module,
+    device: torch.device,
+) -> torch.dtype:
+    if torch.is_autocast_enabled(device.type):
+        return torch.get_autocast_dtype(device.type)
+    embeddings = getattr(getattr(model, "model", None), "embeddings", None)
+    if not isinstance(embeddings, nn.Embedding):
+        raise InfctxContractError(
+            "standard RWKV-7 infctx requires model.embeddings"
+        )
+    return embeddings.weight.dtype
+
+
 def _import_required_module(name: str) -> ModuleType:
     try:
         return import_module(name)
@@ -457,11 +813,15 @@ __all__ = [
     "StandardRwkv7Bindings",
     "StandardRwkv7Config",
     "convert_legacy_rwkv7_checkpoint",
+    "configure_standard_rwkv7_peft",
     "create_standard_rwkv7_model",
     "load_standard_rwkv7_bindings",
     "prepare_standard_rwkv7_for_fsdp2",
     "save_standard_rwkv7_model",
+    "save_standard_rwkv7_lora_adapter",
+    "save_standard_rwkv7_merged_model",
     "standard_rwkv7_blocks",
+    "standard_rwkv7_infctx_forward",
     "standard_rwkv7_optimizer_groups",
     "standard_rwkv7_training_loss",
 ]

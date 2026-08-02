@@ -3,17 +3,45 @@
 ########################################################################################################
 
 import logging
+import os
+
+
+def canonicalize_training_capabilities(args: object):
+    """Validate SFT, PEFT, and infctx CLI fields without selecting a model path."""
+
+    from .infctx import InfctxContractError, validate_infctx_chunk_ctx
+    from .peft import LoraConfig, PeftContractError
+
+    lora_config = LoraConfig.from_namespace(args)
+    args.lora_rank = lora_config.rank
+    args.lora_alpha = lora_config.alpha
+    args.lora_dropout = lora_config.dropout
+    args.lora_target_modules = lora_config.target_modules
+    if getattr(args, "lora_adapter", "") and not lora_config.enabled:
+        raise PeftContractError(
+            "lora_adapter requires an enabled and explicitly configured LoRA model"
+        )
+    if lora_config.enabled and getattr(args, "train_stage", 0) == 1:
+        raise PeftContractError(
+            "LoRA training requires an existing base checkpoint, not train_stage=1"
+        )
+    if getattr(args, "train_type", "standard") == "infctx":
+        validate_infctx_chunk_ctx(args.chunk_ctx, ctx_len=args.ctx_len)
+    elif getattr(args, "chunk_ctx", 0) != 0:
+        raise InfctxContractError(
+            "chunk_ctx is only valid when train_type is infctx"
+        )
+    return lora_config
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     from argparse import ArgumentParser
     from pathlib import Path
-    from pytorch_lightning import Trainer
-    from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
-    import pytorch_lightning as pl
 
-    rank_zero_info("########## work in progress ##########")
+    def rank_zero_info(message: object) -> None:
+        if int(os.environ.get("RANK", "0")) == 0:
+            logging.info(message)
 
     parser = ArgumentParser()
 
@@ -21,7 +49,7 @@ def main() -> None:
         "--load_model",
         default="",
         type=str,
-    )  # standard checkpoint directory or legacy model-input .pth
+    )  # standard Transformers model directory or complete training checkpoint
     parser.add_argument("--wandb", default="", type=str)  # wandb project name. if "" then don't use wandb
     parser.add_argument("--proj_dir", default="out", type=str)
     parser.add_argument("--random_seed", default="-1", type=int)
@@ -74,8 +102,6 @@ def main() -> None:
     parser.add_argument("--grad_clip", default=1.0, type=float) # reduce it to 0.7 / 0.5 / 0.3 / 0.2 for problematic samples
 
     parser.add_argument("--train_stage", default=0, type=int)  # my special pile mode
-    parser.add_argument("--ds_bucket_mb", default=200, type=int)  # deepspeed bucket size in MB. 200 seems enough
-
     parser.add_argument("--head_size", default=64, type=int) # can try larger values for larger models
     parser.add_argument("--head_chunk", default=0, type=int) # 0 = fast, takes more VRAM; 65536 = saves 70% VRAM (when your bsz is large), slower; 4096 = saves 80% VRAM (when your bsz is large), slower
     parser.add_argument("--load_partial", default=0, type=int)
@@ -83,37 +109,55 @@ def main() -> None:
     parser.add_argument("--my_testing", default='x070', type=str)
     parser.add_argument("--kernel", default="", type=str)
     parser.add_argument("--my_exit_tokens", default=0, type=int)
+    parser.add_argument(
+        "--wkv_backend",
+        choices=("reference", "flash_rwkv"),
+        default="flash_rwkv",
+        help="explicit transformers-rwkv WKV backend; accelerated requests fail closed",
+    )
 
-    parser = Trainer.add_argparse_args(parser)
+    parser.add_argument("--accelerator", choices=("gpu", "cuda"), default="gpu")
+    parser.add_argument("--devices", default=1, type=int)
+    parser.add_argument("--num_nodes", default=1, type=int)
+    parser.add_argument(
+        "--precision",
+        choices=("fp32", "tf32", "fp16", "bf16"),
+        default="bf16",
+    )
+    parser.add_argument("--strategy", choices=("fsdp2",), default="fsdp2")
+    parser.add_argument("--accumulate_grad_batches", default=1, type=int)
+    parser.add_argument("--enable_progress_bar", default=False)
     args = parser.parse_args()
     fsdp2_training = str(args.strategy).lower() == "fsdp2"
 
     ########################################################################################################
 
-    import os, warnings, math, datetime, sys, time
+    import datetime, random, warnings
     import numpy as np
     import torch
-    from torch.utils.data import DataLoader
     from .checkpoint import (
         CheckpointContractError,
-        CheckpointLoadKind,
         select_checkpoint_loader,
     )
-    from .infctx import InfctxContractError, validate_infctx_chunk_ctx
-    from .peft import LoraConfig, PeftContractError
-    if "deepspeed" in args.strategy:
-        import deepspeed
-    from pytorch_lightning import seed_everything
+    from .peft import PeftContractError
+    from .standard_model import StandardModelContractError
+
+    if not fsdp2_training:
+        raise StandardModelContractError(
+            "the standard RWKV-7 training runner requires --strategy fsdp2; "
+            "the native Lightning/DeepSpeed model path has been retired"
+        )
 
     if args.random_seed >= 0:
         print(f"########## WARNING: GLOBAL SEED {args.random_seed} THIS WILL AFFECT MULTIGPU SAMPLING ##########\n" * 3)
-        seed_everything(args.random_seed)
+        random.seed(args.random_seed)
+        np.random.seed(args.random_seed)
+        torch.manual_seed(args.random_seed)
+        torch.cuda.manual_seed_all(args.random_seed)
 
     np.set_printoptions(precision=4, suppress=True, linewidth=200)
     warnings.filterwarnings("ignore", ".*Consider increasing the value of the `num_workers` argument*")
     warnings.filterwarnings("ignore", ".*The progress bar already tracks a metric with the*")
-    # os.environ["WDS_SHOW_SEED"] = "1"
-
     args.my_timestamp = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
     args.enable_checkpointing = False
     args.replace_sampler_ddp = False
@@ -139,41 +183,26 @@ def main() -> None:
         * args.micro_bsz
         * accumulation_steps
     )
-    lora_config = LoraConfig.from_namespace(args)
-    args.lora_rank = lora_config.rank
-    args.lora_alpha = lora_config.alpha
-    args.lora_dropout = lora_config.dropout
-    args.lora_target_modules = lora_config.target_modules
-    if args.lora_adapter and not lora_config.enabled:
-        raise PeftContractError(
-            "lora_adapter requires an enabled and explicitly configured LoRA model"
-        )
-    if lora_config.enabled and args.train_stage == 1:
-        raise PeftContractError(
-            "LoRA training requires an existing base checkpoint, not train_stage=1"
-        )
-    if args.train_type == "infctx":
-        validate_infctx_chunk_ctx(args.chunk_ctx, ctx_len=args.ctx_len)
-    elif args.chunk_ctx != 0:
-        raise InfctxContractError(
-            "chunk_ctx is only valid when train_type is infctx"
-        )
-    os.environ["RWKV_MY_TESTING"] = args.my_testing
-    os.environ["RWKV_KERNEL"] = args.kernel
-    os.environ["RWKV_CTXLEN"] = str(args.ctx_len)
-    os.environ["RWKV_HEAD_SIZE"] = str(args.head_size)
-    os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = str(args.head_chunk)
-    os.environ["RWKV_TRAIN_TYPE"] = args.train_type
+    lora_config = canonicalize_training_capabilities(args)
     if args.dim_att <= 0:
         args.dim_att = args.n_embd
+    elif args.dim_att != args.n_embd:
+        raise StandardModelContractError(
+            "transformers-rwkv requires dim_att to equal n_embd"
+        )
     if args.dim_ffn <= 0:
         args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size
+    if args.load_partial != 0:
+        raise StandardModelContractError(
+            "standard transformers-rwkv checkpoints require strict model loading"
+        )
+    if args.head_chunk != 0 or args.kernel:
+        raise StandardModelContractError(
+            "head_chunk and kernel select the retired native model path; use "
+            "wkv_backend with the standard model"
+        )
 
-    args.run_name = f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
-    if fsdp2_training:
-        Path(args.proj_dir).mkdir(parents=True, exist_ok=True)
-    elif not os.path.exists(args.proj_dir):
-        os.makedirs(args.proj_dir)
+    Path(args.proj_dir).mkdir(parents=True, exist_ok=True)
 
     args.epoch_count = args.magic_prime // 40320
     args.epoch_steps = 40320 // args.real_bsz
@@ -181,38 +210,21 @@ def main() -> None:
 
     from .checkpoint_runner import find_latest_training_checkpoint
 
+    explicit_source = Path(args.load_model) if args.load_model else None
+    if explicit_source is not None and explicit_source.suffix == ".pth":
+        raise StandardModelContractError(
+            "legacy .pth cannot be loaded by rwkv-train; convert it with "
+            "rwkv-convert-legacy-checkpoint first"
+        )
+    model_source = None
     resume_checkpoint = None
-    if args.train_stage >= 2:
-        explicit_source = Path(args.load_model) if args.load_model else None
-        if explicit_source is None or explicit_source.suffix != ".pth":
-            if explicit_source is not None:
-                resume_source = explicit_source
-            else:
-                checkpoint_root = Path(args.proj_dir) / "checkpoints"
-                init_weight = Path(args.proj_dir) / "rwkv-init.pth"
-                if checkpoint_root.exists():
-                    resume_source = find_latest_training_checkpoint(
-                        Path(args.proj_dir)
-                    )
-                elif init_weight.is_file() and int(args.epoch_begin) == 0:
-                    args.load_model = str(init_weight)
-                    resume_source = None
-                else:
-                    resume_source = find_latest_training_checkpoint(
-                        Path(args.proj_dir)
-                    )
-            if resume_source is not None:
-                resume_plan = select_checkpoint_loader(resume_source)
-                if resume_plan.manifest is None:
-                    raise CheckpointContractError(
-                        "standard resume checkpoint is missing its manifest"
-                    )
-                resume_checkpoint = resume_plan.source
-                args.load_model = str(resume_plan.source)
-                args.epoch_begin = resume_plan.manifest.progress.epoch
-    elif args.load_model:
-        explicit_source = Path(args.load_model)
-        if explicit_source.is_dir() or explicit_source.name == "manifest.json":
+    if explicit_source is not None:
+        manifest_path = (
+            explicit_source
+            if explicit_source.name == "manifest.json"
+            else explicit_source / "manifest.json"
+        )
+        if manifest_path.is_file():
             resume_plan = select_checkpoint_loader(explicit_source)
             if resume_plan.manifest is None:
                 raise CheckpointContractError(
@@ -221,38 +233,41 @@ def main() -> None:
             resume_checkpoint = resume_plan.source
             args.load_model = str(resume_plan.source)
             args.epoch_begin = resume_plan.manifest.progress.epoch
-
-    if resume_checkpoint is not None and args.load_partial == 1:
-        raise CheckpointContractError(
-            "standard resume does not allow partial model loading"
-        )
+        else:
+            model_source = explicit_source
+    elif args.train_stage >= 2:
+        checkpoint_root = Path(args.proj_dir) / "checkpoints"
+        init_model = Path(args.proj_dir) / "rwkv-init"
+        if checkpoint_root.exists():
+            resume_source = find_latest_training_checkpoint(Path(args.proj_dir))
+            resume_plan = select_checkpoint_loader(resume_source)
+            if resume_plan.manifest is None:
+                raise CheckpointContractError(
+                    "standard resume checkpoint is missing its manifest"
+                )
+            resume_checkpoint = resume_plan.source
+            args.load_model = str(resume_plan.source)
+            args.epoch_begin = resume_plan.manifest.progress.epoch
+        elif init_model.is_dir() and int(args.epoch_begin) == 0:
+            model_source = init_model
+            args.load_model = str(init_model)
+        else:
+            raise CheckpointContractError(
+                "train_stage >= 2 requires a complete training checkpoint or "
+                "standard rwkv-init model"
+            )
     if resume_checkpoint is not None and args.lora_adapter:
         raise PeftContractError(
-            "standard resume restores its own adapter and does not accept lora_adapter"
+            "standard resume restores its own adapter and does not accept "
+            "lora_adapter"
         )
-    if resume_checkpoint is None and lora_config.enabled and not args.load_model:
+    if lora_config.enabled and resume_checkpoint is None and model_source is None:
         raise PeftContractError(
-            "fresh LoRA training requires a legacy base model checkpoint"
-        )
-    if (
-        resume_checkpoint is None
-        and args.load_model
-        and Path(args.load_model).suffix == ".pth"
-        and int(args.epoch_begin) != 0
-        and args.train_stage != 1
-    ):
-        raise CheckpointContractError(
-            "legacy .pth is a model initialization input, not a training resume; "
-            "epoch_begin must be 0"
+            "fresh LoRA training requires a standard base model directory"
         )
 
     samples_per_epoch = args.epoch_steps * args.real_bsz
     tokens_per_epoch = samples_per_epoch * args.ctx_len
-    try:
-        deepspeed_version = deepspeed.__version__
-    except:
-        deepspeed_version = None
-        pass
     rank_zero_info(
         f"""
 ############################################################################
@@ -270,8 +285,7 @@ def main() -> None:
 # Adam = lr {args.lr_init} to {args.lr_final}, warmup {args.warmup_steps} steps, beta {args.betas}, eps {args.adam_eps}
 #
 # Found torch {torch.__version__}, recommend latest torch
-# Found deepspeed {deepspeed_version}, recommend latest deepspeed
-# Found pytorch_lightning {pl.__version__}, recommend 1.9.5
+# Model owner = transformers-rwkv Rwkv7ForCausalLM ({args.wkv_backend})
 #
 ############################################################################
 """
@@ -284,16 +298,11 @@ def main() -> None:
         rank_zero_info("\n\nNote: lr_final = 0 or lr_init = 0. Using linear LR schedule instead.\n\n")
 
     assert args.precision in ["fp32", "tf32", "fp16", "bf16"]
-    os.environ["RWKV_FLOAT_MODE"] = args.precision
     if args.precision == "fp32":
         for i in range(10):
             rank_zero_info("\n\nNote: you are using fp32 (very slow). Try bf16 / tf32 for faster training.\n\n")
     if args.precision == "fp16":
         rank_zero_info("\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n")
-
-    os.environ["RWKV_JIT_ON"] = "1"
-    if "deepspeed_stage_3" in args.strategy:
-        os.environ["RWKV_JIT_ON"] = "0" # somehow incompatible
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
@@ -313,103 +322,51 @@ def main() -> None:
 
     ########################################################################################################
 
-    if fsdp2_training:
-        from .fsdp2_trainer import prepare_fsdp2_launch_device
+    from .fsdp2_trainer import prepare_fsdp2_launch_device
 
-        prepare_fsdp2_launch_device()
+    prepare_fsdp2_launch_device()
 
-    from .trainer import train_callback, generate_init_weight
     from .dataset import MyDataset
+    from .standard_model import (
+        configure_standard_rwkv7_peft,
+        create_standard_rwkv7_model,
+        save_standard_rwkv7_model,
+    )
 
     train_data = MyDataset(args)
     args.vocab_size = train_data.vocab_size
-
-    from .model import RWKV
-    model = RWKV(args)
-
-    if len(args.load_model) == 0 or args.train_stage == 1:  # shall we build the initial weights?
-        init_weight_name = f"{args.proj_dir}/rwkv-init.pth"
-        generate_init_weight(model, init_weight_name)  # save initial weights
-        args.load_model = init_weight_name
-
-    rank_zero_info(f"########## Loading {args.load_model}... ##########")
-    if resume_checkpoint is None:
-        legacy_plan = select_checkpoint_loader(
-            Path(args.load_model),
-            allow_legacy_pth_for_conversion=True,
-        )
-        if legacy_plan.kind is not CheckpointLoadKind.LEGACY_PTH_FOR_CONVERSION:
-            raise CheckpointContractError(
-                "model initialization requires a legacy .pth input"
-            )
-        load_dict = torch.load(
-            legacy_plan.source,
-            map_location="cpu",
-            weights_only=True,
-            mmap=True,
-        )
-        load_keys = list(load_dict.keys())
-        for k in load_keys:
-            if k.startswith('_forward_module.'):
-                load_dict[k.replace('_forward_module.','')] = load_dict[k]
-                del load_dict[k]
-        if model.lora_config.enabled:
-            model.load_base_state_dict(
-                load_dict,
-                allow_partial=args.load_partial == 1,
-            )
-            if args.lora_adapter:
-                model.load_lora_adapter(Path(args.lora_adapter))
-        else:
-            if args.load_partial == 1:
-                load_keys = load_dict.keys()
-                for k in model.state_dict():
-                    if k not in load_keys:
-                        load_dict[k] = model.state_dict()[k]
-            model.load_state_dict(load_dict)
-    else:
-        rank_zero_info(
-            "Model, optimizer, scheduler, RNG, and data cursor will be restored "
-            "together when the training runtime is initialized."
-        )
-
-    if fsdp2_training:
-        from .fsdp2_trainer import run_fsdp2_training
-
-        run_fsdp2_training(
-            args,
-            model,
-            train_data,
-            resume_checkpoint=resume_checkpoint,
-        )
-        return
-
-    trainer = Trainer.from_argparse_args(
-        args,
-        callbacks=[
-            train_callback(
-                args,
-                resume_checkpoint=resume_checkpoint,
-            )
-        ],
+    args.run_name = (
+        f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
     )
 
-    if trainer.global_rank == 0:
-        for n in model.state_dict():
-            shape = model.state_dict()[n].shape
-            s0 = str(shape[0]) if len(shape) > 0 else ""
-            s1 = str(shape[1]) if len(shape) > 1 else ""
-            s2 = str(shape[2]) if len(shape) > 2 else ""
-            s3 = str(shape[3]) if len(shape) > 3 else ""
-            print(f"{s0.ljust(5)} {s1.ljust(5)} {s2.ljust(5)} {s3.ljust(5)} {n}")
+    if resume_checkpoint is not None:
+        model = create_standard_rwkv7_model(args)
+        rank_zero_info(
+            "Model, optimizer, scheduler, RNG, and data cursor will be restored "
+            "together when the FSDP2 runtime is initialized."
+        )
+    elif model_source is not None:
+        rank_zero_info(f"########## Loading {model_source}... ##########")
+        model = create_standard_rwkv7_model(args, model_source=model_source)
+    else:
+        model = create_standard_rwkv7_model(args)
+        init_model = Path(args.proj_dir) / "rwkv-init"
+        save_standard_rwkv7_model(model, init_model)
+        args.load_model = str(init_model)
+        rank_zero_info(
+            f"########## Initialized standard model at {init_model} ##########"
+        )
+    configure_standard_rwkv7_peft(
+        model,
+        lora_config,
+        adapter_path=Path(args.lora_adapter) if args.lora_adapter else None,
+    )
 
-    if "deepspeed" in args.strategy:
-        trainer.strategy.config["zero_optimization"]["allgather_bucket_size"] = args.ds_bucket_mb * 1000 * 1000
-        trainer.strategy.config["zero_optimization"]["reduce_bucket_size"] = args.ds_bucket_mb * 1000 * 1000
+    from .fsdp2_trainer import run_fsdp2_training
 
-    # must set shuffle=False, persistent_workers=False (because worker is in another thread)
-    data_loader = DataLoader(train_data, shuffle=False, pin_memory=True, batch_size=args.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)
-
-    if trainer.global_rank == 0:
-        print(f'### Preparing for training (loaded {args.load_model}). Please wait...')
-    trainer.fit(model, data_loader)
+    run_fsdp2_training(
+        args,
+        model,
+        train_data,
+        resume_checkpoint=resume_checkpoint,
+    )

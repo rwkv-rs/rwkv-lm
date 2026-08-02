@@ -2,12 +2,20 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
-import json, math, random, os, sys
-import numpy as np
+import logging
+import math
+import os
+
 import torch
 from torch.utils.data import Dataset
-from pytorch_lightning.utilities import rank_zero_info
+
 from .binidx import MMapIndexedDataset
+
+
+def rank_zero_info(message: object) -> None:
+    if int(os.environ.get("RANK", "0")) == 0:
+        logging.info(message)
+
 
 def is_prime(n):
     if n <= 1:

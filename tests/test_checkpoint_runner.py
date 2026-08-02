@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import random
 from collections.abc import Mapping
 from pathlib import Path
@@ -9,7 +8,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from pytorch_lightning.strategies import SingleDeviceStrategy
 from torch import nn
 
 from rwkv_lm import checkpoint_runner as runner_module
@@ -20,7 +18,7 @@ from rwkv_lm.checkpoint import (
 )
 from rwkv_lm.checkpoint_runner import EpochCheckpointRunnerAdapter
 from rwkv_lm.dataset import MyDataset
-from rwkv_lm.trainer import scheduled_learning_rate, train_callback
+from rwkv_lm.trainer import scheduled_learning_rate
 
 
 def _backend(*, version: str = "1.9.5") -> BackendIdentity:
@@ -70,66 +68,6 @@ def _new_runner() -> tuple[nn.Module, torch.optim.Optimizer]:
     model = nn.Sequential(nn.Linear(3, 5), nn.Tanh(), nn.Linear(5, 1))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.05)
     return model, optimizer
-
-
-def _trainer_args(tmp_path: Path, *, epoch_begin: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        accumulate_grad_batches=1,
-        adam_eps=1e-8,
-        beta1=0.9,
-        beta2=0.99,
-        chunk_ctx=0,
-        ctx_len=16,
-        data_file="fixture.bin",
-        data_type="binidx",
-        dim_att=32,
-        dim_ffn=96,
-        epoch_begin=epoch_begin,
-        epoch_count=4,
-        epoch_save=1,
-        epoch_steps=3,
-        grad_clip=1.0,
-        grad_cp=0,
-        head_chunk=0,
-        head_size=64,
-        kernel="",
-        lora_alpha=0.0,
-        lora_dropout=0.0,
-        lora_rank=0,
-        lora_target_modules=(),
-        lr_final=1e-4,
-        lr_init=1e-3,
-        magic_prime=120962,
-        micro_bsz=4,
-        my_exit_tokens=0,
-        my_testing="x070",
-        n_embd=32,
-        n_layer=2,
-        precision="bf16",
-        proj_dir=str(tmp_path),
-        random_seed=20260801,
-        real_bsz=4,
-        train_stage=3,
-        train_type="standard",
-        vocab_size=128,
-        warmup_steps=10,
-        weight_decay=0.01,
-    )
-
-
-def _trainer_state(
-    optimizer: torch.optim.Optimizer,
-    *,
-    global_step: int,
-    current_epoch: int = 0,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        current_epoch=current_epoch,
-        global_step=global_step,
-        optimizers=[optimizer],
-        strategy=SingleDeviceStrategy(device="cpu"),
-        world_size=1,
-    )
 
 
 def _seed_all() -> None:
@@ -276,41 +214,6 @@ def test_resume_migrates_implicit_accumulation_default(tmp_path: Path) -> None:
     )
 
     assert progress.global_step == 3
-    _assert_nested_equal(resumed_model.state_dict(), model.state_dict())
-    _assert_nested_equal(resumed_optimizer.state_dict(), optimizer.state_dict())
-
-
-def test_lightning_callback_owns_standard_save_and_resume_boundary(
-    tmp_path: Path,
-) -> None:
-    _seed_all()
-    model, optimizer = _new_runner()
-    _train_steps(model, optimizer, start_step=0, step_count=3)
-    save_trainer = _trainer_state(optimizer, global_step=0)
-    save_callback = train_callback(_trainer_args(tmp_path, epoch_begin=0))
-    save_callback.on_fit_start(save_trainer, model)
-    save_trainer.global_step = 3
-    save_callback._save_epoch_checkpoint(save_trainer, model)
-
-    checkpoint = tmp_path / "checkpoints" / "epoch-00000001"
-    plan = select_checkpoint_loader(checkpoint)
-    assert plan.complete_resume
-    assert plan.manifest is not None
-    assert plan.manifest.progress.global_step == 3
-    assert plan.manifest.progress.epoch == 1
-    training_config = json.loads(
-        (checkpoint / plan.manifest.training_config.path).read_bytes()
-    )
-    assert training_config["accumulate_grad_batches"] == 1
-
-    resumed_model, resumed_optimizer = _new_runner()
-    resume_trainer = _trainer_state(resumed_optimizer, global_step=0)
-    resume_callback = train_callback(
-        _trainer_args(tmp_path, epoch_begin=1),
-        resume_checkpoint=checkpoint,
-    )
-    resume_callback.on_fit_start(resume_trainer, resumed_model)
-
     _assert_nested_equal(resumed_model.state_dict(), model.state_dict())
     _assert_nested_equal(resumed_optimizer.state_dict(), optimizer.state_dict())
 

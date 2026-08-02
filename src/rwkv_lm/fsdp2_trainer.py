@@ -1,4 +1,4 @@
-"""Standalone FSDP2 training owner used by the existing RWKV CLI entrypoint."""
+"""FSDP2 training owner for the standard Transformers RWKV-7 model."""
 
 from __future__ import annotations
 
@@ -21,18 +21,23 @@ from .activation_checkpointing import (
 )
 from .checkpoint import CheckpointContractError
 from .checkpoint_fsdp2 import FSDP2CheckpointRunnerAdapter
+from .standard_model import (
+    prepare_standard_rwkv7_for_fsdp2,
+    standard_rwkv7_optimizer_groups,
+    standard_rwkv7_training_loss,
+)
 from .trainer import _checkpoint_training_config, scheduled_learning_rate
 
-_FSDP2_WRAP_POLICY = "rwkv-blocks-then-root-v1"
+_FSDP2_WRAP_POLICY = "transformers-rwkv7-blocks-then-root-v1"
 _T = TypeVar("_T")
 
 
 def run_fsdp2_training(args, model, train_data, *, resume_checkpoint=None) -> None:
-    """Run the existing RWKV model and dataset under composable FSDP2.
+    """Run the standard RWKV-7 CausalLM and dataset under composable FSDP2.
 
-    This path is intentionally separate from PyTorch Lightning 1.9.5, which
-    predates composable FSDP2. It reuses the repository's one RWKV model,
-    optimizer group owner, dataset, loss, and stateless LR schedule.
+    Model definition, recurrent state, loss, and WKV backend dispatch are owned
+    by transformers-rwkv; this runner owns sharding, optimizer state, data, and
+    the stateless learning-rate schedule without relying on Lightning.
     """
 
     initialized_here = False
@@ -78,24 +83,30 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
     model.to(device)
     if isinstance(model, FSDPModule):
         raise CheckpointContractError("RWKV model was already wrapped by fully_shard")
-    activation_checkpointing = getattr(
+    blocks = prepare_standard_rwkv7_for_fsdp2(
         model,
-        "_fsdp2_activation_checkpointing",
-        None,
+        activation_checkpointing=args.grad_cp == 1,
+    )
+    activation_checkpointing = getattr(
+        model, "_fsdp2_activation_checkpointing", None
     )
     if not isinstance(activation_checkpointing, FSDP2ActivationCheckpointing):
         raise CheckpointContractError(
             "RWKV model is missing its FSDP2 activation checkpoint policy"
         )
     activation_checkpointing.require_rwkv_blocks(
-        model.blocks,
+        blocks,
         enabled=args.grad_cp == 1,
     )
-    for block in model.blocks:
+    for block in blocks:
         fully_shard(block, mesh=mesh, mp_policy=mixed_precision)
     fully_shard(model, mesh=mesh, mp_policy=mixed_precision)
 
-    optimizer_groups = model.build_optimizer_groups(is_global_zero=rank == 0)
+    optimizer_groups = standard_rwkv7_optimizer_groups(
+        model,
+        weight_decay=args.weight_decay,
+        is_global_zero=rank == 0,
+    )
     optimizer_type = torch.optim.AdamW if args.weight_decay > 0 else torch.optim.Adam
     optimizer = optimizer_type(
         optimizer_groups,
@@ -185,15 +196,19 @@ def _run_initialized(args, model, train_data, *, resume_checkpoint) -> None:
                 if param_group["weight_decay"] > 0:
                     param_group["weight_decay"] = args.weight_decay
 
-            def forward_loss(batch, microbatch_offset):
+            def forward_loss(batch, _microbatch_offset):
                 inputs, targets = (
                     tensor.to(device, non_blocking=True) for tensor in batch
                 )
-                batch_idx = (
-                    optimizer_step_idx * accumulation_steps + microbatch_offset
-                )
                 with autocast():
-                    return model.training_step((inputs, targets), batch_idx)
+                    return standard_rwkv7_training_loss(
+                        model,
+                        inputs,
+                        targets,
+                        train_type=args.train_type,
+                        chunk_ctx=args.chunk_ctx,
+                        ctx_len=args.ctx_len,
+                    )
 
             loss = _run_accumulated_optimizer_step(
                 model,
