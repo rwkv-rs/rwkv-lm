@@ -239,6 +239,7 @@ def standard_bindings(monkeypatch):
         standard_model._CONVERTER_MODULE: converter_module,
     }
     monkeypatch.setattr(standard_model, "import_module", modules.__getitem__)
+    return modules
 
 
 def test_standard_model_owns_real_loss_gradients_and_optimizer_groups(
@@ -674,3 +675,26 @@ def test_missing_standard_dependency_fails_closed(monkeypatch) -> None:
         match="requires transformers-rwkv",
     ):
         create_standard_rwkv7_model(_args())
+
+
+def test_standard_flash_backend_failure_propagates_without_fallback(
+    standard_bindings,
+) -> None:
+    class _FailClosedCausalLM(_FakeCausalLM):
+        def forward(self, **_kwargs):
+            raise RuntimeError(
+                "Explicit FlashRWKV request failed closed: FLA public "
+                "chunk_rwkv7 did not select FlashRWKV; fallback is disabled"
+            )
+
+    standard_bindings[
+        standard_model._MODEL_MODULE
+    ].Rwkv7ForCausalLM = _FailClosedCausalLM
+    model = create_standard_rwkv7_model(_args(wkv_backend="flash_rwkv"))
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+
+    with pytest.raises(
+        RuntimeError,
+        match="FLA public chunk_rwkv7 did not select FlashRWKV; fallback is disabled",
+    ):
+        standard_rwkv7_training_loss(model, input_ids, input_ids)

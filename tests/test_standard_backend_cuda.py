@@ -5,6 +5,7 @@ the rwkv-lm contract at the standard Transformers model boundary: real backend
 selection, recurrent state handoff, TBPTT detach, and PEFT gradients.
 """
 
+from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
@@ -25,17 +26,20 @@ from rwkv_lm.standard_model import (
 def _require_standard_flash_stack():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the standard FlashRWKV integration test")
-    pytest.importorskip("transformers.models.rwkv7.modeling_rwkv7")
-    pytest.importorskip("flash_rwkv")
-    pytest.importorskip("fla.ops.rwkv7")
-    from fla.ops.rwkv7 import get_last_rwkv7_provider
-    from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
-
-    if not FlashRWKVBackend.is_available():
-        pytest.skip(
-            "the installed fla-rwkv / FlashRWKV provider contract is unavailable"
+    try:
+        import_module("transformers.models.rwkv7.modeling_rwkv7")
+        rwkv7 = import_module("fla.ops.rwkv7")
+    except ImportError as error:
+        pytest.fail(
+            "standard FlashRWKV CUDA integration requires the Transformers "
+            f"RWKV-7 model and FLA public API: {error}",
+            pytrace=False,
         )
-    return get_last_rwkv7_provider
+    chunk_rwkv7 = getattr(rwkv7, "chunk_rwkv7", None)
+    get_last_provider = getattr(rwkv7, "get_last_rwkv7_provider", None)
+    if not callable(chunk_rwkv7) or not callable(get_last_provider):
+        pytest.fail("FLA must publicly expose chunk_rwkv7 and get_last_rwkv7_provider")
+    return get_last_provider
 
 
 def _args(backend: str) -> SimpleNamespace:
