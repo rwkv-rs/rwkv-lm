@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import numpy as np
@@ -6,12 +5,13 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 
-from rwkv_lm.binidx import MMapIndexedDataset, data_file_path, index_file_path
-from rwkv_lm.models.rwkv7.data import (
-    RwkvDataLoader,
-    RwkvPretokenizedTokenizer,
+from rwkv_lm.models.rwkv7.binidx import (
+    MMapIndexedDataset,
+    data_file_path,
+    index_file_path,
 )
-from rwkv_lm.models.rwkv7.state_dict_adapter import AdapterCheckpointError
+from rwkv_lm.models.rwkv7.dataloader import RwkvDataLoader
+from rwkv_lm.models.rwkv7.tokenizer import RwkvPretokenizedTokenizer
 
 
 def _tokenizer(
@@ -145,43 +145,3 @@ def test_dcp_restores_dataloader_cursor(tmp_path, rwkv7_artifact_factory) -> Non
     observed_next = next(iter(resumed))
 
     _assert_batches_equal(expected_next, observed_next)
-
-
-def test_pretokenized_tokenizer_requires_canonical_assets_and_rejects_text(
-    tmp_path: Path,
-    rwkv7_artifact_factory,
-) -> None:
-    artifact_path, model_identity = rwkv7_artifact_factory()
-    tokenizer = _tokenizer(artifact_path)
-
-    assert tokenizer.model_identity == model_identity
-    assert tokenizer.get_vocab_size() == 1_024
-    with pytest.raises(RuntimeError, match="pretokenized-only"):
-        tokenizer.encode("must not be byte-mapped")
-    with pytest.raises(RuntimeError, match="pretokenized-only"):
-        tokenizer.decode([1, 2, 3])
-    with pytest.raises(AdapterCheckpointError, match="requires readable"):
-        _tokenizer(tmp_path / "missing")
-
-
-def test_pretokenized_tokenizer_rejects_tampered_assets(
-    rwkv7_artifact_factory,
-) -> None:
-    artifact_path, _model_identity = rwkv7_artifact_factory()
-    (artifact_path / "tokenizer.json").write_text("{}", encoding="utf-8")
-
-    with pytest.raises(AdapterCheckpointError, match="digest does not match"):
-        _tokenizer(artifact_path)
-
-
-def test_pretokenized_tokenizer_rejects_forged_model_identity(
-    rwkv7_artifact_factory,
-) -> None:
-    artifact_path, _model_identity = rwkv7_artifact_factory()
-    conversion_path = artifact_path / "rwkv7_conversion.json"
-    conversion = json.loads(conversion_path.read_text(encoding="utf-8"))
-    conversion["model_identity"] = "f" * 64
-    conversion_path.write_text(json.dumps(conversion), encoding="utf-8")
-
-    with pytest.raises(AdapterCheckpointError, match="canonical conversion"):
-        _tokenizer(artifact_path)

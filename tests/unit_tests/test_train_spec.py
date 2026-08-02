@@ -14,7 +14,7 @@ from rwkv_lm.models.rwkv7.config_registry import (
     rwkv7_1_5b,
     rwkv7_debugmodel,
 )
-from rwkv_lm.models.rwkv7.data import RwkvDataLoader
+from rwkv_lm.models.rwkv7.dataloader import RwkvDataLoader
 from rwkv_lm.models.rwkv7.state_dict_adapter import AdapterCheckpointError
 
 

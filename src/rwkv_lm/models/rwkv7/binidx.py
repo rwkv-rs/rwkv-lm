@@ -1,4 +1,4 @@
-"""Memory-mapped Megatron ``.bin``/``.idx`` token storage."""
+"""Memory-mapped RWKV ``.bin``/``.idx`` token storage."""
 
 from __future__ import annotations
 

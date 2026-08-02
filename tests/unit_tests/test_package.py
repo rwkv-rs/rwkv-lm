@@ -55,6 +55,19 @@ def test_duplicate_generic_training_stack_is_removed() -> None:
     assert not list(ROOT.glob("demo-training-run*.sh"))
 
 
+def test_rwkv7_specific_extensions_share_the_model_owner() -> None:
+    package = ROOT / "src" / "rwkv_lm"
+    model_package = package / "models" / "rwkv7"
+
+    assert (model_package / "tokenizer.py").is_file()
+    assert (model_package / "binidx.py").is_file()
+    assert (model_package / "dataloader.py").is_file()
+    assert not (package / "components" / "tokenizer.py").exists()
+    assert not (package / "datasets" / "binidx.py").exists()
+    assert not (package / "datasets" / "dataloader.py").exists()
+    assert not (package / "binidx.py").exists()
+
+
 def test_hosted_cpu_contract_installs_public_fla_and_runs_full_unit_suite() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     workflow = (ROOT / ".github" / "workflows" / "cpu-contract.yml").read_text()

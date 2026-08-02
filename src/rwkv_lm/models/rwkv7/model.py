@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import pairwise
@@ -150,40 +149,6 @@ class Rwkv7ModelOutput:
 
     logits: torch.Tensor
     state: Rwkv7RecurrentState
-
-
-def _normal_parameter(parameter: nn.Parameter) -> None:
-    nn.init.normal_(parameter, mean=0.0, std=0.02)
-
-
-def _zero_parameter(parameter: nn.Parameter) -> None:
-    nn.init.zeros_(parameter)
-
-
-def _one_parameter(parameter: nn.Parameter) -> None:
-    nn.init.ones_(parameter)
-
-
-def _linear_config(
-    in_features: int,
-    out_features: int,
-    *,
-    zero: bool = False,
-) -> Linear.Config:
-    return Linear.Config(
-        in_features=in_features,
-        out_features=out_features,
-        bias=False,
-        param_init={"weight": _zero_parameter if zero else _normal_parameter},
-    )
-
-
-def _layer_norm_config(hidden_size: int, epsilon: float) -> LayerNorm.Config:
-    return LayerNorm.Config(
-        normalized_shape=hidden_size,
-        eps=epsilon,
-        param_init={"weight": _one_parameter, "bias": _zero_parameter},
-    )
 
 
 class Rwkv7TimeMix(Module):
@@ -726,116 +691,6 @@ class Rwkv7Model(BaseModel):
         return logits
 
 
-def build_rwkv7_config(
-    *,
-    vocab_size: int,
-    context_length: int,
-    hidden_size: int,
-    num_hidden_layers: int,
-    intermediate_size: int,
-    head_size: int,
-    layer_norm_epsilon: float = 1e-5,
-    group_norm_epsilon: float = 64e-5,
-    recurrent_chunk_size: int | None = None,
-    detach_state_between_chunks: bool = False,
-) -> Rwkv7Model.Config:
-    """Build the declarative TorchTitan config tree for one RWKV-7 flavor."""
-    if hidden_size % head_size != 0:
-        raise ValueError("RWKV-7 hidden_size must be divisible by head_size")
-    decay_rank = max(32, round(2.5 * math.sqrt(hidden_size) / 32) * 32)
-    value_rank = max(32, round(1.7 * math.sqrt(hidden_size) / 32) * 32)
-    gate_rank = max(32, round(5.0 * math.sqrt(hidden_size) / 32) * 32)
-
-    model_config = Rwkv7Model.Config(
-        vocab_size=vocab_size,
-        context_length=context_length,
-        hidden_size=hidden_size,
-        num_hidden_layers=num_hidden_layers,
-        intermediate_size=intermediate_size,
-        head_size=head_size,
-        layer_norm_epsilon=layer_norm_epsilon,
-        group_norm_epsilon=group_norm_epsilon,
-        recurrent_chunk_size=recurrent_chunk_size,
-        detach_state_between_chunks=detach_state_between_chunks,
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size,
-            embedding_dim=hidden_size,
-            param_init={"weight": _normal_parameter},
-        ),
-        layers=[],
-        norm=_layer_norm_config(hidden_size, layer_norm_epsilon),
-        lm_head=_linear_config(hidden_size, vocab_size),
-    )
-    for layer_id in range(num_hidden_layers):
-        direct_parameter_names = [
-            "x_r",
-            "x_w",
-            "x_k",
-            "x_v",
-            "x_a",
-            "x_g",
-            "w0",
-            "a0",
-            "k_k",
-            "k_a",
-            "r_k",
-        ]
-        if layer_id > 0:
-            direct_parameter_names.append("v0")
-        time_mix = Rwkv7TimeMix.Config(
-            layer_id=layer_id,
-            hidden_size=hidden_size,
-            head_size=head_size,
-            param_init={name: _zero_parameter for name in direct_parameter_names},
-            w1=_linear_config(hidden_size, decay_rank, zero=True),
-            w2=_linear_config(decay_rank, hidden_size, zero=True),
-            a1=_linear_config(hidden_size, decay_rank, zero=True),
-            a2=_linear_config(decay_rank, hidden_size, zero=True),
-            v1=(
-                _linear_config(hidden_size, value_rank, zero=True)
-                if layer_id > 0
-                else None
-            ),
-            v2=(
-                _linear_config(value_rank, hidden_size, zero=True)
-                if layer_id > 0
-                else None
-            ),
-            g1=_linear_config(hidden_size, gate_rank, zero=True),
-            g2=_linear_config(gate_rank, hidden_size, zero=True),
-            receptance=_linear_config(hidden_size, hidden_size),
-            key=_linear_config(hidden_size, hidden_size),
-            value=_linear_config(hidden_size, hidden_size),
-            output=_linear_config(hidden_size, hidden_size),
-            ln_x=GroupNorm.Config(
-                num_groups=hidden_size // head_size,
-                num_channels=hidden_size,
-                eps=group_norm_epsilon,
-                param_init={"weight": _one_parameter, "bias": _zero_parameter},
-            ),
-        )
-        channel_mix = Rwkv7ChannelMix.Config(
-            hidden_size=hidden_size,
-            param_init={"x_k": _zero_parameter},
-            key=_linear_config(hidden_size, intermediate_size),
-            value=_linear_config(intermediate_size, hidden_size),
-        )
-        model_config.layers.append(
-            Rwkv7Block.Config(
-                ln0=(
-                    _layer_norm_config(hidden_size, layer_norm_epsilon)
-                    if layer_id == 0
-                    else Identity.Config()
-                ),
-                ln1=_layer_norm_config(hidden_size, layer_norm_epsilon),
-                ln2=_layer_norm_config(hidden_size, layer_norm_epsilon),
-                att=time_mix,
-                ffn=channel_mix,
-            )
-        )
-    return model_config
-
-
 __all__ = [
     "RWKV7_FLASH_RWKV_REVISION",
     "RWKV7_FLA_RECURRENT_REVISION",
@@ -846,6 +701,5 @@ __all__ = [
     "Rwkv7ModelOutput",
     "Rwkv7RecurrentState",
     "Rwkv7TimeMix",
-    "build_rwkv7_config",
     "initialize_rwkv7_runtime",
 ]

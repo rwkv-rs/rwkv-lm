@@ -11,7 +11,8 @@ from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.trainer import Trainer
 
 from . import model_registry
-from .data import RwkvDataLoader, RwkvPretokenizedTokenizer
+from .dataloader import RwkvDataLoader
+from .tokenizer import RwkvPretokenizedTokenizer
 
 
 def _training_config(
