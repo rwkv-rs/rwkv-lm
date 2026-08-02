@@ -507,7 +507,7 @@ wheels = [
 [[package]]
 name = "flash-linear-attention"
 version = "0.5.2"
-source = { git = "https://github.com/rwkv-rs/fla-rwkv.git?rev=a4a8aa98df6ec5322f194a80ec57363dd045adfc#a4a8aa98df6ec5322f194a80ec57363dd045adfc" }
+source = { git = "https://github.com/rwkv-rs/fla-rwkv.git?rev=88e8ff9d29dcebadb89ebad62ee76951729ea0df#88e8ff9d29dcebadb89ebad62ee76951729ea0df" }
 dependencies = [
     { name = "einops" },
     { name = "transformers" },
@@ -525,7 +525,7 @@ flash-rwkv = [
 [[package]]
 name = "flash-rwkv"
 version = "0.1.0"
-source = { git = "https://github.com/rwkv-rs/FlashRWKV.git?rev=866aafd2eed146b0eda1ce03444009ae030f89e3#866aafd2eed146b0eda1ce03444009ae030f89e3" }
+source = { git = "https://github.com/rwkv-rs/FlashRWKV.git?rev=c637985558c398de1db6a3c0523b1eec206a88d4#c637985558c398de1db6a3c0523b1eec206a88d4" }
 dependencies = [
     { name = "torch" },
 ]
@@ -2399,8 +2399,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "flash-linear-attention", extras = ["cuda", "flash-rwkv"], git = "https://github.com/rwkv-rs/fla-rwkv.git?rev=a4a8aa98df6ec5322f194a80ec57363dd045adfc" },
-    { name = "flash-rwkv", git = "https://github.com/rwkv-rs/FlashRWKV.git?rev=866aafd2eed146b0eda1ce03444009ae030f89e3" },
+    { name = "flash-linear-attention", extras = ["cuda", "flash-rwkv"], git = "https://github.com/rwkv-rs/fla-rwkv.git?rev=88e8ff9d29dcebadb89ebad62ee76951729ea0df" },
+    { name = "flash-rwkv", git = "https://github.com/rwkv-rs/FlashRWKV.git?rev=c637985558c398de1db6a3c0523b1eec206a88d4" },
     { name = "numpy", specifier = ">=2.0.0" },
     { name = "torch" },
     { name = "torchtitan", git = "https://github.com/pytorch/torchtitan.git?rev=681fd4b509b183ba33f70d39580b848b36e66ca5" },

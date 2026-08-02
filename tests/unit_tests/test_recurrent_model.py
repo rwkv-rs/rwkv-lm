@@ -174,8 +174,28 @@ def test_runtime_provenance_fails_before_model_build(monkeypatch) -> None:
     )
     trainer_config = rwkv7_debugmodel()
 
-    with pytest.raises(RuntimeError, match="revision mismatch"):
+    with pytest.raises(RuntimeError, match="recurrent runtime requires"):
         trainer_config.model_spec.model.update_from_config(config=trainer_config)
+
+
+def test_runtime_rejects_stale_transformers_provenance(monkeypatch) -> None:
+    import transformers.models.rwkv7 as transformers_rwkv7
+
+    monkeypatch.setattr(model_module, "_RWKV7_RUNTIME", None)
+    monkeypatch.setattr(
+        transformers_rwkv7,
+        "validate_rwkv7_runtime_provenance",
+        lambda: {
+            "revision": "a4a8aa98df6ec5322f194a80ec57363dd045adfc",
+            "flash_rwkv_revision": "866aafd2eed146b0eda1ce03444009ae030f89e3",
+        },
+    )
+    trainer_config = rwkv7_debugmodel()
+
+    with pytest.raises(RuntimeError, match="does not match RWKV-LM"):
+        trainer_config.model_spec.model.update_from_config(config=trainer_config)
+
+    assert model_module._RWKV7_RUNTIME is None
 
 
 def test_runtime_preflight_is_once_and_forward_uses_bound_callables(
@@ -185,15 +205,41 @@ def test_runtime_preflight_is_once_and_forward_uses_bound_callables(
     import transformers.models.rwkv7 as transformers_rwkv7
 
     events = []
+    recurrent_outputs = []
 
     def validate_provenance():
         events.append("provenance")
-        return {}
+        return {
+            "revision": model_module.RWKV7_FLA_REVISION,
+            "flash_rwkv_revision": model_module.RWKV7_FLASH_RWKV_REVISION,
+        }
 
-    def chunk_rwkv7(*inputs, initial_state, **kwargs):
-        del kwargs
+    def recurrent_rwkv7(
+        r,
+        w,
+        k,
+        v,
+        a,
+        b,
+        scale=1.0,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=None,
+        state_indices=None,
+        mode="fp32io16",
+    ):
+        del r, w, k, a, b
+        assert scale == 1.0
+        assert initial_state is not None
+        assert output_final_state is True
+        assert cu_seqlens is None
+        assert state_indices is None
+        assert mode == "fp32io16"
         events.append("kernel")
-        return inputs[3], initial_state
+        output = v * 1.0
+        output.retain_grad()
+        recurrent_outputs.append(output)
+        return output, initial_state
 
     monkeypatch.setattr(model_module, "_RWKV7_RUNTIME", None)
     monkeypatch.setattr(
@@ -201,7 +247,12 @@ def test_runtime_preflight_is_once_and_forward_uses_bound_callables(
         "validate_rwkv7_runtime_provenance",
         validate_provenance,
     )
-    monkeypatch.setattr(fla_rwkv7, "chunk_rwkv7", chunk_rwkv7)
+    monkeypatch.setattr(fla_rwkv7, "recurrent_rwkv7", recurrent_rwkv7)
+    monkeypatch.setattr(
+        fla_rwkv7,
+        "FLASH_RWKV_SOURCE_REVISION",
+        model_module.RWKV7_FLASH_RWKV_REVISION,
+    )
     monkeypatch.setattr(
         fla_rwkv7,
         "get_last_rwkv7_provider",
@@ -214,6 +265,8 @@ def test_runtime_preflight_is_once_and_forward_uses_bound_callables(
     model = model_config.build()
     model.init_states()
     time_mix = model.layers["0"].att
+    with torch.no_grad():
+        time_mix.g2.weight.fill_(0.01)
     hidden_states = torch.randn(1, 16, model_config.hidden_size)
     shift = torch.zeros(1, model_config.hidden_size)
     num_heads = model_config.hidden_size // model_config.head_size
@@ -223,24 +276,51 @@ def test_runtime_preflight_is_once_and_forward_uses_bound_callables(
         model_config.head_size,
         model_config.head_size,
     )
-    time_mix(hidden_states, torch.zeros_like(hidden_states), shift, wkv)
-    time_mix(hidden_states, torch.zeros_like(hidden_states), shift, wkv)
+    first_output = time_mix(
+        hidden_states,
+        torch.zeros_like(hidden_states),
+        shift,
+        wkv,
+    )[0]
+    second_output = time_mix(
+        hidden_states,
+        torch.zeros_like(hidden_states),
+        shift,
+        wkv,
+    )[0]
+    (first_output.square().sum() + second_output.square().sum()).backward()
 
     assert events == ["provenance", "kernel", "kernel"]
+    assert len(recurrent_outputs) == 2
+    assert all(output.grad is not None for output in recurrent_outputs)
+    assert all(torch.count_nonzero(output.grad) > 0 for output in recurrent_outputs)
 
 
 def test_positions_and_bound_runtime_are_fullgraph_compile_compatible(
     monkeypatch,
 ) -> None:
-    def chunk_rwkv7(*inputs, initial_state, **kwargs):
-        del kwargs
-        return inputs[3], initial_state
+    def recurrent_rwkv7(
+        r,
+        w,
+        k,
+        v,
+        a,
+        b,
+        *,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        state_indices,
+        mode,
+    ):
+        del r, w, k, a, b, output_final_state, cu_seqlens, state_indices, mode
+        return v, initial_state
 
     monkeypatch.setattr(
         model_module,
         "_RWKV7_RUNTIME",
         model_module._Rwkv7Runtime(
-            chunk_rwkv7=chunk_rwkv7,
+            recurrent_rwkv7=recurrent_rwkv7,
             get_last_provider=lambda: "flash_rwkv",
         ),
     )
@@ -252,3 +332,23 @@ def test_positions_and_bound_runtime_are_fullgraph_compile_compatible(
     logits = compiled(tokens, positions=positions)
 
     assert logits.shape == (1, 16, 1_024)
+
+
+def test_product_runtime_rejects_non_flash_provider(monkeypatch) -> None:
+    def recurrent_rwkv7(*inputs, initial_state, **kwargs):
+        del kwargs
+        return inputs[3], initial_state
+
+    monkeypatch.setattr(
+        model_module,
+        "_RWKV7_RUNTIME",
+        model_module._Rwkv7Runtime(
+            recurrent_rwkv7=recurrent_rwkv7,
+            get_last_provider=lambda: "reference",
+        ),
+    )
+    model = _model()
+    tokens = torch.arange(16).view(1, 16)
+
+    with pytest.raises(RuntimeError, match="fallback is disabled"):
+        model(tokens, positions=torch.arange(16).view(1, 16))

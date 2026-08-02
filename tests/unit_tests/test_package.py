@@ -10,6 +10,15 @@ def test_torchtitan_entrypoints_and_revision_are_authoritative() -> None:
     dependencies = project["project"]["dependencies"]
 
     assert (
+        "flash-linear-attention[cuda,flash-rwkv] @ "
+        "git+https://github.com/rwkv-rs/fla-rwkv.git"
+        "@88e8ff9d29dcebadb89ebad62ee76951729ea0df"
+    ) in dependencies
+    assert (
+        "flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git"
+        "@c637985558c398de1db6a3c0523b1eec206a88d4"
+    ) in dependencies
+    assert (
         "torchtitan @ git+https://github.com/pytorch/torchtitan.git"
         "@681fd4b509b183ba33f70d39580b848b36e66ca5"
     ) in dependencies

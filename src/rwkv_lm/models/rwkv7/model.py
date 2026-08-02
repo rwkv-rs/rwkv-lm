@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
@@ -17,11 +18,22 @@ from torchtitan.models.common.nn_modules import GroupNorm, Identity, LayerNorm
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
 
+RWKV7_FLA_RECURRENT_REVISION = "6c4c52c5632e954a8f67d91e4652d551fc57387e"
+RWKV7_FLA_REVISION = "88e8ff9d29dcebadb89ebad62ee76951729ea0df"
+RWKV7_FLASH_RWKV_REVISION = "c637985558c398de1db6a3c0523b1eec206a88d4"
+_RWKV7_RECURRENT_PARAMETERS = {
+    "initial_state",
+    "output_final_state",
+    "cu_seqlens",
+    "state_indices",
+    "mode",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class _Rwkv7Runtime:
-    chunk_rwkv7: Callable[..., tuple[torch.Tensor, torch.Tensor]]
-    get_last_provider: Callable[[], str]
+    recurrent_rwkv7: Callable[..., tuple[torch.Tensor, torch.Tensor]]
+    get_last_provider: Callable[[], str | None]
 
 
 _RWKV7_RUNTIME: _Rwkv7Runtime | None = None
@@ -35,16 +47,61 @@ def initialize_rwkv7_runtime() -> None:
 
     from transformers.models.rwkv7 import validate_rwkv7_runtime_provenance
 
-    validate_rwkv7_runtime_provenance()
+    try:
+        provenance = validate_rwkv7_runtime_provenance()
+    except (ImportError, RuntimeError) as error:
+        raise RuntimeError(
+            "RWKV-LM recurrent runtime requires transformers-rwkv provenance for "
+            f"FLA {RWKV7_FLA_REVISION} (semantic contract "
+            f"{RWKV7_FLA_RECURRENT_REVISION}) and FlashRWKV "
+            f"{RWKV7_FLASH_RWKV_REVISION}"
+        ) from error
+    if not isinstance(provenance, Mapping):
+        raise TypeError("transformers-rwkv runtime provenance must be a mapping")
+    expected_provenance = {
+        "revision": RWKV7_FLA_REVISION,
+        "flash_rwkv_revision": RWKV7_FLASH_RWKV_REVISION,
+    }
+    observed_provenance = {name: provenance.get(name) for name in expected_provenance}
+    if observed_provenance != expected_provenance:
+        raise RuntimeError(
+            "transformers-rwkv runtime provenance does not match RWKV-LM: "
+            f"expected={expected_provenance}, observed={observed_provenance}"
+        )
 
-    from fla.ops.rwkv7 import chunk_rwkv7, get_last_rwkv7_provider
+    from fla.ops.rwkv7 import (
+        FLASH_RWKV_SOURCE_REVISION,
+        get_last_rwkv7_provider,
+        recurrent_rwkv7,
+    )
 
-    if not callable(chunk_rwkv7) or not callable(get_last_rwkv7_provider):
+    if not callable(recurrent_rwkv7) or not callable(get_last_rwkv7_provider):
         raise TypeError(
-            "FLA must expose public chunk_rwkv7 and get_last_rwkv7_provider callables"
+            "FLA must expose public recurrent_rwkv7 and "
+            "get_last_rwkv7_provider callables"
+        )
+    if FLASH_RWKV_SOURCE_REVISION != RWKV7_FLASH_RWKV_REVISION:
+        raise RuntimeError(
+            "FLA public recurrent provider pins the wrong FlashRWKV revision: "
+            f"expected={RWKV7_FLASH_RWKV_REVISION}, "
+            f"observed={FLASH_RWKV_SOURCE_REVISION}"
+        )
+    try:
+        recurrent_parameters = inspect.signature(recurrent_rwkv7).parameters
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "FLA public recurrent_rwkv7 signature is not inspectable"
+        ) from error
+    missing_parameters = sorted(
+        _RWKV7_RECURRENT_PARAMETERS - recurrent_parameters.keys()
+    )
+    if missing_parameters:
+        raise TypeError(
+            "FLA public recurrent_rwkv7 lacks required parameters: "
+            f"{missing_parameters}"
         )
     _RWKV7_RUNTIME = _Rwkv7Runtime(
-        chunk_rwkv7=chunk_rwkv7,
+        recurrent_rwkv7=recurrent_rwkv7,
         get_last_provider=get_last_rwkv7_provider,
     )
 
@@ -250,7 +307,7 @@ class Rwkv7TimeMix(Module):
             )
         ]
         kernel_inputs[1] = (-F.softplus(-kernel_inputs[1]) - 0.5).contiguous()
-        output, final_wkv_state = runtime.chunk_rwkv7(
+        recurrent_result = runtime.recurrent_rwkv7(
             *kernel_inputs,
             initial_state=wkv_state,
             output_final_state=True,
@@ -258,14 +315,24 @@ class Rwkv7TimeMix(Module):
             state_indices=None,
             mode="fp32io16",
         )
+        if not isinstance(recurrent_result, tuple) or len(recurrent_result) != 2:
+            raise RuntimeError("FLA public recurrent_rwkv7 returned an invalid result")
+        output, final_wkv_state = recurrent_result
         if runtime.get_last_provider() != "flash_rwkv":
             raise RuntimeError(
-                "FLA public chunk_rwkv7 did not select FlashRWKV; fallback is disabled"
+                "FLA public recurrent_rwkv7 did not select FlashRWKV; "
+                "fallback is disabled"
             )
-        if output.shape != kernel_inputs[3].shape:
-            raise RuntimeError("FLA public chunk_rwkv7 returned an invalid output")
-        if final_wkv_state.shape != wkv_state.shape:
-            raise RuntimeError("FLA public chunk_rwkv7 returned an invalid state")
+        if (
+            not isinstance(output, torch.Tensor)
+            or output.shape != kernel_inputs[3].shape
+        ):
+            raise RuntimeError("FLA public recurrent_rwkv7 returned an invalid output")
+        if (
+            not isinstance(final_wkv_state, torch.Tensor)
+            or final_wkv_state.shape != wkv_state.shape
+        ):
+            raise RuntimeError("FLA public recurrent_rwkv7 returned an invalid state")
 
         output = output.reshape(batch_size, sequence_length, hidden_size)
         output = self.ln_x(output.flatten(0, 1)).view_as(output)
@@ -770,6 +837,9 @@ def build_rwkv7_config(
 
 
 __all__ = [
+    "RWKV7_FLASH_RWKV_REVISION",
+    "RWKV7_FLA_RECURRENT_REVISION",
+    "RWKV7_FLA_REVISION",
     "Rwkv7Block",
     "Rwkv7ChannelMix",
     "Rwkv7Model",

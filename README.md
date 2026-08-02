@@ -6,7 +6,7 @@ conversion, and DCP checkpoint lifecycle. RWKV-specific code owns the readable
 single-device model, recurrent state, binidx cursor, declarative sharding, and
 the standard Transformers state-dict mapping.
 
-The WKV call uses the public `fla.ops.rwkv7.chunk_rwkv7` interface after
+The WKV call uses the public `fla.ops.rwkv7.recurrent_rwkv7` interface after
 `transformers-rwkv` validates the pinned FLA/FlashRWKV runtime provenance. No
 reference or native-kernel fallback exists in this package.
 
