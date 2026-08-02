@@ -4,8 +4,9 @@
 # Run demo-training-prepare.sh with the same MODEL_TYPE & N_LAYER & N_EMBD first
 # Or, rename your base model to rwkv-init.pth and put it in the output folder
 #
-# The trainer will load the last rwkv-*.pth in the folder, such that it can continue from a stopped run
-# Therefore check the log (### Loading rwkv-xxx.pth... ###), and make sure you don't have extra rwkv-*.pth there
+# The trainer resumes from the newest verified checkpoints/epoch-* directory.
+# If none exists, rwkv-init.pth is accepted only as a model initialization input.
+# Standard checkpoint v1 currently fails closed for distributed strategies.
 #
 #######################################################################################################################
 #
@@ -35,7 +36,7 @@ EPOCH_SAVE=50 # save every 50 "miniepochs" (1 miniepoch = 40320 * ctx_len tokens
 N_NODE=1 # number of nodes
 GPU_PER_NODE=8 # number of GPUs per node
 #
-python train.py --load_model "0" --wandb "RWKV-7-Pile" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
+python train.py --wandb "RWKV-7-Pile" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --train_stage 3 --epoch_count 999999 --epoch_begin 0 \
  --data_file "/mnt/nvme0n1/pile/pile_20B_tokenizer_text_document" --my_exit_tokens 332115325534 --magic_prime 81082817 \
  --num_nodes $N_NODE --micro_bsz $M_BSZ --n_layer $N_LAYER --n_embd $N_EMBD \

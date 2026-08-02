@@ -8,6 +8,7 @@ import logging
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     from argparse import ArgumentParser
+    from pathlib import Path
     from pytorch_lightning import Trainer
     from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
     import pytorch_lightning as pl
@@ -16,7 +17,11 @@ def main() -> None:
 
     parser = ArgumentParser()
 
-    parser.add_argument("--load_model", default="", type=str)  # full path, with .pth
+    parser.add_argument(
+        "--load_model",
+        default="",
+        type=str,
+    )  # standard checkpoint directory or legacy model-input .pth
     parser.add_argument("--wandb", default="", type=str)  # wandb project name. if "" then don't use wandb
     parser.add_argument("--proj_dir", default="out", type=str)
     parser.add_argument("--random_seed", default="-1", type=int)
@@ -109,28 +114,69 @@ def main() -> None:
     args.epoch_steps = 40320 // args.real_bsz
     assert args.epoch_steps * args.real_bsz == 40320
 
-    if args.train_stage >= 2:  # find latest saved model
-        list_p = []
-        for p in os.listdir(args.proj_dir):
-            if p.startswith("rwkv") and p.endswith(".pth"):
-                p = ((p.split("-"))[1].split("."))[0]
-                if p != "final":
-                    if p == "init":
-                        p = -1
-                    else:
-                        p = int(p)
-                    list_p += [p]
-        list_p.sort()
-        max_p = list_p[-1]
-        if len(list_p) > 1:
-            args.my_pile_prev_p = list_p[-2]  # in case max_p is corrupted
-        if max_p == -1:
-            args.load_model = f"{args.proj_dir}/rwkv-init.pth"
-        else:
-            args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
-            if args.warmup_steps < 0:
-                args.warmup_steps = 10
-        args.epoch_begin = max_p + 1
+    from .checkpoint import (
+        CheckpointContractError,
+        CheckpointLoadKind,
+        select_checkpoint_loader,
+    )
+    from .checkpoint_runner import find_latest_training_checkpoint
+
+    resume_checkpoint = None
+    if args.train_stage >= 2:
+        explicit_source = Path(args.load_model) if args.load_model else None
+        if explicit_source is None or explicit_source.suffix != ".pth":
+            if explicit_source is not None:
+                resume_source = explicit_source
+            else:
+                checkpoint_root = Path(args.proj_dir) / "checkpoints"
+                init_weight = Path(args.proj_dir) / "rwkv-init.pth"
+                if checkpoint_root.exists():
+                    resume_source = find_latest_training_checkpoint(
+                        Path(args.proj_dir)
+                    )
+                elif init_weight.is_file() and int(args.epoch_begin) == 0:
+                    args.load_model = str(init_weight)
+                    resume_source = None
+                else:
+                    resume_source = find_latest_training_checkpoint(
+                        Path(args.proj_dir)
+                    )
+            if resume_source is not None:
+                resume_plan = select_checkpoint_loader(resume_source)
+                if resume_plan.manifest is None:
+                    raise CheckpointContractError(
+                        "standard resume checkpoint is missing its manifest"
+                    )
+                resume_checkpoint = resume_plan.source
+                args.load_model = str(resume_plan.source)
+                args.epoch_begin = resume_plan.manifest.progress.epoch
+    elif args.load_model:
+        explicit_source = Path(args.load_model)
+        if explicit_source.is_dir() or explicit_source.name == "manifest.json":
+            resume_plan = select_checkpoint_loader(explicit_source)
+            if resume_plan.manifest is None:
+                raise CheckpointContractError(
+                    "standard resume checkpoint is missing its manifest"
+                )
+            resume_checkpoint = resume_plan.source
+            args.load_model = str(resume_plan.source)
+            args.epoch_begin = resume_plan.manifest.progress.epoch
+
+    if resume_checkpoint is not None and args.load_partial == 1:
+        raise CheckpointContractError(
+            "standard resume does not allow partial model loading"
+        )
+    if (
+        resume_checkpoint is None
+        and args.load_model
+        and Path(args.load_model).suffix == ".pth"
+        and int(args.epoch_begin) != 0
+        and args.train_stage != 1
+    ):
+        raise CheckpointContractError(
+            "legacy .pth is a model initialization input, not a training resume; "
+            "epoch_begin must be 0"
+        )
 
     samples_per_epoch = args.epoch_steps * args.real_bsz
     tokens_per_epoch = samples_per_epoch * args.ctx_len
@@ -214,35 +260,46 @@ def main() -> None:
         args.load_model = init_weight_name
 
     rank_zero_info(f"########## Loading {args.load_model}... ##########")
-    try:
-        load_dict = torch.load(args.load_model, map_location="cpu", weights_only=True, mmap=True)
+    if resume_checkpoint is None:
+        legacy_plan = select_checkpoint_loader(
+            Path(args.load_model),
+            allow_legacy_pth_for_conversion=True,
+        )
+        if legacy_plan.kind is not CheckpointLoadKind.LEGACY_PTH_FOR_CONVERSION:
+            raise CheckpointContractError(
+                "model initialization requires a legacy .pth input"
+            )
+        load_dict = torch.load(
+            legacy_plan.source,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
         load_keys = list(load_dict.keys())
         for k in load_keys:
             if k.startswith('_forward_module.'):
                 load_dict[k.replace('_forward_module.','')] = load_dict[k]
                 del load_dict[k]
-    except:
-        rank_zero_info(f"Bad checkpoint {args.load_model}")
-        if args.train_stage >= 2:  # try again using another checkpoint
-            max_p = args.my_pile_prev_p
-            if max_p == -1:
-                args.load_model = f"{args.proj_dir}/rwkv-init.pth"
-            else:
-                args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
-            args.epoch_begin = max_p + 1
-            rank_zero_info(f"Trying {args.load_model}")
-            load_dict = torch.load(args.load_model, map_location="cpu", weights_only=True, mmap=True)
-
-    if args.load_partial == 1:
-        load_keys = load_dict.keys()
-        for k in model.state_dict():
-            if k not in load_keys:
-                load_dict[k] = model.state_dict()[k]
-    model.load_state_dict(load_dict)
+        if args.load_partial == 1:
+            load_keys = load_dict.keys()
+            for k in model.state_dict():
+                if k not in load_keys:
+                    load_dict[k] = model.state_dict()[k]
+        model.load_state_dict(load_dict)
+    else:
+        rank_zero_info(
+            "Model, optimizer, scheduler, RNG, and data cursor will be restored "
+            "together when the Trainer is initialized."
+        )
 
     trainer = Trainer.from_argparse_args(
         args,
-        callbacks=[train_callback(args)],
+        callbacks=[
+            train_callback(
+                args,
+                resume_checkpoint=resume_checkpoint,
+            )
+        ],
     )
 
     if trainer.global_rank == 0:

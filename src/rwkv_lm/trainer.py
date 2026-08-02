@@ -1,19 +1,177 @@
 import os, math, time, datetime, subprocess
+from importlib import metadata
+from pathlib import Path
+
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
+from pytorch_lightning.strategies import (
+    DDPStrategy,
+    DeepSpeedStrategy,
+    SingleDeviceStrategy,
+)
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 
-def my_save(args, trainer, dd, ff):
-    if 'deepspeed_stage_3' in args.strategy:
-        trainer.save_checkpoint(ff, weights_only=True)
+from .checkpoint import BackendIdentity, CheckpointContractError
+from .checkpoint_runner import EpochCheckpointRunnerAdapter
+
+
+_CHECKPOINT_CONFIG_FIELDS = (
+    "adam_eps",
+    "beta1",
+    "beta2",
+    "ctx_len",
+    "data_file",
+    "data_type",
+    "dim_att",
+    "dim_ffn",
+    "epoch_steps",
+    "grad_clip",
+    "grad_cp",
+    "head_chunk",
+    "head_size",
+    "kernel",
+    "lr_final",
+    "lr_init",
+    "magic_prime",
+    "micro_bsz",
+    "my_exit_tokens",
+    "my_testing",
+    "n_embd",
+    "n_layer",
+    "precision",
+    "random_seed",
+    "real_bsz",
+    "train_stage",
+    "vocab_size",
+    "warmup_steps",
+    "weight_decay",
+)
+
+
+def _checkpoint_training_config(args):
+    missing = [name for name in _CHECKPOINT_CONFIG_FIELDS if not hasattr(args, name)]
+    if missing:
+        raise CheckpointContractError(
+            f"training arguments are missing checkpoint fields: {missing}"
+        )
+    return {name: getattr(args, name) for name in _CHECKPOINT_CONFIG_FIELDS}
+
+
+def _checkpoint_backend_identity(trainer):
+    strategy = trainer.strategy
+    world_size = int(trainer.world_size)
+    if isinstance(strategy, DeepSpeedStrategy):
+        name = "deepspeed"
+        version = (
+            f"{metadata.version('deepspeed')};"
+            f"pytorch-lightning={pl.__version__};torch={torch.__version__}"
+        )
+        zero_optimization = strategy.config.get("zero_optimization", {})
+        stage = zero_optimization.get("stage")
+        if stage == 2:
+            normalized_strategy = "deepspeed_stage_2"
+        elif stage == 3:
+            normalized_strategy = "deepspeed_stage_3"
+        else:
+            raise CheckpointContractError(
+                "standard checkpoint cannot identify the active DeepSpeed ZeRO stage"
+            )
+    elif isinstance(strategy, DDPStrategy):
+        name = "pytorch-lightning"
+        version = f"{pl.__version__};torch={torch.__version__}"
+        normalized_strategy = "ddp"
+    elif isinstance(strategy, SingleDeviceStrategy):
+        name = "pytorch-lightning"
+        version = f"{pl.__version__};torch={torch.__version__}"
+        normalized_strategy = "single_device"
     else:
-        torch.save(dd, ff)
+        raise CheckpointContractError(
+            "standard checkpoint does not recognize the active Lightning strategy: "
+            f"{type(strategy).__module__}.{type(strategy).__qualname__}"
+        )
+    return BackendIdentity(
+        name=name,
+        version=version,
+        strategy=normalized_strategy,
+        world_size=world_size,
+        state_dict_type="full",
+    )
+
 
 class train_callback(pl.Callback):
-    def __init__(self, args):
+    def __init__(self, args, *, resume_checkpoint=None):
         super().__init__()
         self.args = args
+        self.resume_checkpoint = (
+            Path(resume_checkpoint) if resume_checkpoint is not None else None
+        )
+        self.checkpoint_adapter = None
+        self.save_at_epoch_end = False
+
+    def on_fit_start(self, trainer, pl_module):
+        args = self.args
+        if int(getattr(args, "accumulate_grad_batches", 1)) != 1:
+            raise CheckpointContractError(
+                "standard checkpoint v1 requires accumulate_grad_batches=1"
+            )
+        self.checkpoint_adapter = EpochCheckpointRunnerAdapter(
+            backend=_checkpoint_backend_identity(trainer),
+            training_config=_checkpoint_training_config(args),
+            samples_per_epoch=int(args.epoch_steps) * int(args.real_bsz),
+        )
+        if self.resume_checkpoint is None:
+            return
+        if trainer.global_step != 0:
+            raise CheckpointContractError(
+                "standard resume must run before the new Trainer advances"
+            )
+        progress = self.checkpoint_adapter.restore(
+            self.resume_checkpoint,
+            model=pl_module,
+            optimizer=trainer.optimizers[0],
+        )
+        expected_global_step = int(progress.epoch) * int(args.epoch_steps)
+        if (
+            progress.epoch != int(args.epoch_begin)
+            or progress.global_step != expected_global_step
+        ):
+            raise CheckpointContractError(
+                "standard resume progress does not match the epoch schedule"
+            )
+
+    def _request_epoch_boundary_stop(self, trainer, batch_idx):
+        if int(batch_idx) + 1 != int(self.args.epoch_steps):
+            raise CheckpointContractError(
+                "standard checkpoint v1 cannot stop and save inside an epoch"
+            )
+        self.save_at_epoch_end = True
+        trainer.should_stop = True
+
+    def _save_epoch_checkpoint(self, trainer, pl_module):
+        args = self.args
+        if self.checkpoint_adapter is None:
+            raise CheckpointContractError("checkpoint adapter was not initialized")
+        next_epoch = int(args.epoch_begin) + int(trainer.current_epoch) + 1
+        global_step = int(trainer.global_step) + int(args.epoch_begin) * int(
+            args.epoch_steps
+        )
+        if global_step != next_epoch * int(args.epoch_steps):
+            raise CheckpointContractError(
+                "standard checkpoint v1 can only publish a complete epoch"
+            )
+        checkpoint_dir = (
+            Path(args.proj_dir)
+            / "checkpoints"
+            / f"epoch-{next_epoch:08d}"
+        )
+        self.checkpoint_adapter.save(
+            checkpoint_dir,
+            model=pl_module,
+            optimizer=trainer.optimizers[0],
+            global_step=global_step,
+            next_epoch=next_epoch,
+        )
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         args = self.args
@@ -35,13 +193,7 @@ class train_callback(pl.Callback):
             else:
                 lr = (lr + args.lr_init * lr_mult) / 2
             if progress >= 1:
-                if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy):
-                    my_save(
-                        args, trainer,
-                        pl_module.state_dict(),
-                        f"{args.proj_dir}/rwkv-final.pth",
-                    )
-                    exit(0)
+                self._request_epoch_boundary_stop(trainer, batch_idx)
         if trainer.global_step < w_step:
             lr = lr * (0.01 + 0.99 * trainer.global_step / w_step)
 
@@ -107,15 +259,9 @@ class train_callback(pl.Callback):
                     lll["kt/s"] = kt_s
                 trainer.my_wandb.log(lll, step=int(real_step))
 
-        if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy): # save pth
-            if args.magic_prime > 0:
-                if int(real_step) == int(args.magic_prime // args.real_bsz) - 1:
-                    to_save_dict = pl_module.state_dict()
-                    my_save(
-                        args, trainer,
-                        to_save_dict,
-                        f"{args.proj_dir}/rwkv-final.pth",
-                    )
+        if args.magic_prime > 0:
+            if int(real_step) == int(args.magic_prime // args.real_bsz) - 1:
+                self._request_epoch_boundary_stop(trainer, batch_idx)
                 
 
     def on_train_epoch_start(self, trainer, pl_module):
@@ -129,24 +275,13 @@ class train_callback(pl.Callback):
 
     def on_train_epoch_end(self, trainer, pl_module):
         args = self.args
-        to_save_dict = {}
-        if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy):  # save pth
-            if (args.epoch_save > 0 and trainer.current_epoch % args.epoch_save == 0) or (trainer.current_epoch == args.epoch_count - 1):
-                if args.data_type == 'wds_img':
-                    raw_dict = pl_module.state_dict()
-                    for k in raw_dict:
-                        if k.startswith('encoder.') or k.startswith('decoder.'):
-                            to_save_dict[k] = raw_dict[k]
-                else:
-                    to_save_dict = pl_module.state_dict()
-                try:
-                    my_save(
-                        args, trainer,
-                        to_save_dict,
-                        f"{args.proj_dir}/rwkv-{args.epoch_begin + trainer.current_epoch}.pth",
-                    )
-                except Exception as e:
-                    print('Error\n\n', e, '\n\n')
+        save_due = (
+            args.epoch_save > 0
+            and trainer.current_epoch % args.epoch_save == 0
+        ) or (trainer.current_epoch == args.epoch_count - 1)
+        if save_due or self.save_at_epoch_end:
+            self._save_epoch_checkpoint(trainer, pl_module)
+            self.save_at_epoch_end = False
 
         if trainer.is_global_zero:  # logging
             trainer.my_log.write(f"{args.epoch_begin + trainer.current_epoch} {trainer.my_epoch_loss:.6f} {math.exp(trainer.my_epoch_loss):.4f} {trainer.my_lr:.8f} {datetime.datetime.now()} {trainer.current_epoch}\n")
@@ -191,6 +326,7 @@ def generate_init_weight(model, init_weight_name):
                     mmm = mm[k].squeeze().float().cpu().numpy()
                     print(mmm[:10], '...', mmm[-10:])
 
+    # This is a legacy model-only initialization input, never a resume checkpoint.
     print(f"Save to {init_weight_name}...")
     torch.save(mm, init_weight_name)
 

@@ -16,7 +16,6 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 
-
 CHECKPOINT_FORMAT = "rwkv-lm-training-checkpoint"
 CHECKPOINT_MANIFEST_FILENAME = "manifest.json"
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -38,9 +37,16 @@ SUPPORTED_STATE_SERIALIZATIONS = MappingProxyType(
         "data_cursor": "rwkv-binidx-epoch-cursor-v1",
     }
 )
+SUPPORTED_SCHEDULER_SERIALIZATIONS = frozenset(
+    {
+        "rwkv-callback-schedule-v1",
+        "torch-lr-scheduler-json-v1",
+    }
+)
 SUPPORTED_STANDARD_PROFILES = frozenset(
     {
         ("deepspeed", "deepspeed_stage_2", "full"),
+        ("pytorch", "single_process", "full"),
         ("pytorch-lightning", "ddp", "full"),
         ("pytorch-lightning", "single_device", "full"),
     }
@@ -75,7 +81,7 @@ class ArtifactRecord:
         relative_path: str,
         *,
         serialization: str,
-    ) -> "ArtifactRecord":
+    ) -> ArtifactRecord:
         root = _checkpoint_root(checkpoint_dir)
         path = _artifact_path(root, relative_path)
         size_bytes, sha256 = _file_identity(path)
@@ -87,7 +93,7 @@ class ArtifactRecord:
         )
 
     @classmethod
-    def from_dict(cls, raw: object) -> "ArtifactRecord":
+    def from_dict(cls, raw: object) -> ArtifactRecord:
         value = _exact_mapping(
             raw,
             {"path", "serialization", "sha256", "size_bytes"},
@@ -133,7 +139,7 @@ class BackendIdentity:
             )
 
     @classmethod
-    def from_dict(cls, raw: object) -> "BackendIdentity":
+    def from_dict(cls, raw: object) -> BackendIdentity:
         value = _exact_mapping(
             raw,
             {"name", "version", "strategy", "world_size", "state_dict_type"},
@@ -175,7 +181,7 @@ class TrainingProgress:
             )
 
     @classmethod
-    def from_dict(cls, raw: object) -> "TrainingProgress":
+    def from_dict(cls, raw: object) -> TrainingProgress:
         value = _exact_mapping(
             raw,
             {"global_step", "epoch", "step_in_epoch"},
@@ -261,10 +267,20 @@ class CheckpointManifest:
                 "training_config serialization must be canonical-json"
             )
         for name, expected_serialization in SUPPORTED_STATE_SERIALIZATIONS.items():
-            if self.states[name].serialization != expected_serialization:
+            actual_serialization = self.states[name].serialization
+            if name == "scheduler":
+                valid = actual_serialization in SUPPORTED_SCHEDULER_SERIALIZATIONS
+            else:
+                valid = actual_serialization == expected_serialization
+            if not valid:
                 raise CheckpointContractError(
                     f"checkpoint {name} serialization must be "
-                    f"{expected_serialization}"
+                    + (
+                        "one of: "
+                        + ", ".join(sorted(SUPPORTED_SCHEDULER_SERIALIZATIONS))
+                        if name == "scheduler"
+                        else expected_serialization
+                    )
                 )
         paths = [self.training_config.path]
         paths.extend(record.path for record in self.states.values())
@@ -273,7 +289,7 @@ class CheckpointManifest:
         object.__setattr__(self, "states", MappingProxyType(dict(self.states)))
 
     @classmethod
-    def from_dict(cls, raw: object) -> "CheckpointManifest":
+    def from_dict(cls, raw: object) -> CheckpointManifest:
         value = _exact_mapping(
             raw,
             {
@@ -300,7 +316,7 @@ class CheckpointManifest:
         )
 
     @classmethod
-    def read(cls, path: Path) -> "CheckpointManifest":
+    def read(cls, path: Path) -> CheckpointManifest:
         if path.is_symlink() or not path.is_file():
             raise CheckpointContractError(
                 f"checkpoint manifest must be a regular file: {path}"
@@ -321,8 +337,7 @@ class CheckpointManifest:
             "progress": self.progress.to_dict(),
             "training_config": self.training_config.to_dict(),
             "states": {
-                name: self.states[name].to_dict()
-                for name in REQUIRED_STATE_COMPONENTS
+                name: self.states[name].to_dict() for name in REQUIRED_STATE_COMPONENTS
             },
         }
 
@@ -360,7 +375,13 @@ class CheckpointManifest:
             _artifact_path(root, self.states["scheduler"].path),
             "scheduler state",
         )
-        if set(scheduler) != {"global_step"}:
+        scheduler_serialization = self.states["scheduler"].serialization
+        expected_scheduler_fields = (
+            {"global_step"}
+            if scheduler_serialization == "rwkv-callback-schedule-v1"
+            else {"global_step", "state_dict"}
+        )
+        if set(scheduler) != expected_scheduler_fields:
             raise CheckpointContractError("scheduler state has invalid fields")
         scheduler_global_step = scheduler["global_step"]
         _validate_non_negative_int(
@@ -371,6 +392,14 @@ class CheckpointManifest:
             raise CheckpointContractError(
                 "scheduler state must exactly match progress global_step"
             )
+        if scheduler_serialization == "torch-lr-scheduler-json-v1":
+            scheduler_state_dict = scheduler["state_dict"]
+            if not isinstance(scheduler_state_dict, dict) or any(
+                not isinstance(key, str) for key in scheduler_state_dict
+            ):
+                raise CheckpointContractError(
+                    "torch scheduler state_dict must be a JSON object"
+                )
         data_cursor = _read_canonical_json_object(
             _artifact_path(root, self.states["data_cursor"].path),
             "data cursor",
@@ -450,7 +479,9 @@ def select_checkpoint_loader(
     """Select a standard loader profile or an opaque legacy converter input."""
 
     if path.is_symlink():
-        raise CheckpointContractError(f"checkpoint source must not be a symlink: {path}")
+        raise CheckpointContractError(
+            f"checkpoint source must not be a symlink: {path}"
+        )
     if path.is_dir():
         checkpoint_dir = _checkpoint_root(path)
         manifest_path = checkpoint_dir / CHECKPOINT_MANIFEST_FILENAME
@@ -640,18 +671,19 @@ def _read_canonical_json_object(path: Path, owner: str) -> Mapping[str, object]:
 
 
 __all__ = [
-    "ArtifactRecord",
-    "BackendIdentity",
     "CHECKPOINT_FORMAT",
     "CHECKPOINT_MANIFEST_FILENAME",
     "CHECKPOINT_SCHEMA_VERSION",
+    "REQUIRED_STATE_COMPONENTS",
+    "SUPPORTED_SCHEDULER_SERIALIZATIONS",
+    "SUPPORTED_STANDARD_PROFILES",
+    "SUPPORTED_STATE_SERIALIZATIONS",
+    "ArtifactRecord",
+    "BackendIdentity",
     "CheckpointContractError",
     "CheckpointLoadKind",
     "CheckpointLoadPlan",
     "CheckpointManifest",
-    "REQUIRED_STATE_COMPONENTS",
-    "SUPPORTED_STANDARD_PROFILES",
-    "SUPPORTED_STATE_SERIALIZATIONS",
     "TrainingProgress",
     "select_checkpoint_loader",
 ]

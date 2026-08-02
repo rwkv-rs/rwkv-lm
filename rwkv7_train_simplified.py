@@ -5,6 +5,7 @@
 import random, torch, os, math, time
 import numpy as np
 import wandb, datetime
+from pathlib import Path
 from types import SimpleNamespace
 import torch, random
 from torch import nn
@@ -12,6 +13,8 @@ import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.cpp_extension import load
 from rwkv_lm.cuda_sources import cuda_sources
+from rwkv_lm.checkpoint import BackendIdentity
+from rwkv_lm.checkpoint_runner import EpochCheckpointRunnerAdapter
 def set_seed_all(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -312,7 +315,34 @@ for step in range(steps):
     clip_grad_norm_(model.parameters(), max_norm=1.0)
     opt.step(); sch.step()
 
-torch.save(model.state_dict(),"out.pth")
+EpochCheckpointRunnerAdapter(
+    backend=BackendIdentity(
+        name="pytorch",
+        version=torch.__version__,
+        strategy="single_process",
+        world_size=1,
+        state_dict_type="full",
+    ),
+    training_config={
+        "demo": "rwkv7_train_simplified",
+        "vocab_size": V,
+        "hidden_size": C,
+        "batch_size": B,
+        "sequence_length": T,
+        "steps": steps,
+        "lr_init": lr0,
+        "lr_final": lr1,
+        "scheduler": "CosineAnnealingLR",
+    },
+    samples_per_epoch=B * steps,
+).save(
+    Path("out-simplified/checkpoints/epoch-00000001"),
+    model=model,
+    optimizer=opt,
+    scheduler=sch,
+    global_step=steps,
+    next_epoch=1,
+)
 
 print('#'*100)
 print('simple check (NOTE: here random inputs are considered for diff too, for simplicity)')
