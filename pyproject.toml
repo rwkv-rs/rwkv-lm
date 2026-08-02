@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-rwkv-convert-legacy-checkpoint = "rwkv_lm.models.rwkv7.state_dict_adapter:converter_main"
+rwkv-convert-legacy-checkpoint = "transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf:main"
 rwkv-train = "torchtitan.train:main"
 
 [tool.setuptools.packages.find]

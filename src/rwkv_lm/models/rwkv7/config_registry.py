@@ -1,6 +1,7 @@
 """TorchTitan training configurations for RWKV-7."""
 
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.lora import LoRAConverter
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
@@ -45,4 +46,19 @@ def rwkv7_1_5b() -> Trainer.Config:
     config = rwkv7_debugmodel()
     config.model_spec = model_registry("g1h-1.5b")
     config.training.seq_len = 10_240
+    return config
+
+
+def rwkv7_debugmodel_lora() -> Trainer.Config:
+    config = rwkv7_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            LoRAConverter.Config(
+                rank=8,
+                alpha=16.0,
+                target_modules=["receptance", "key", "value", "output"],
+            )
+        ],
+    )
     return config

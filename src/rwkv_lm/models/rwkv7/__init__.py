@@ -1,16 +1,18 @@
-"""TorchTitan model registry for transformers-rwkv RWKV-7."""
+"""TorchTitan model registry for RWKV-7."""
 
 from __future__ import annotations
 
+from torchtitan.models.utils import validate_converter_order
+from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import Rwkv7Model
+from .model import Rwkv7Model, build_rwkv7_config
 from .parallelize import parallelize_rwkv7
 from .state_dict_adapter import Rwkv7StateDictAdapter
 
 
 def _debug_model() -> Rwkv7Model.Config:
-    return Rwkv7Model.Config(
+    return build_rwkv7_config(
         vocab_size=1_024,
         context_length=128,
         hidden_size=128,
@@ -21,7 +23,14 @@ def _debug_model() -> Rwkv7Model.Config:
 
 
 def _g1h_1_5b() -> Rwkv7Model.Config:
-    return Rwkv7Model.Config()
+    return build_rwkv7_config(
+        vocab_size=65_536,
+        context_length=10_240,
+        hidden_size=2_048,
+        num_hidden_layers=24,
+        intermediate_size=7_168,
+        head_size=64,
+    )
 
 
 rwkv7_configs = {
@@ -30,11 +39,18 @@ rwkv7_configs = {
 }
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(
+    flavor: str,
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> ModelSpec:
     try:
         model_config = rwkv7_configs[flavor]()
     except KeyError as error:
         raise ValueError(f"unknown RWKV-7 model flavor: {flavor}") from error
+    if converters is not None:
+        validate_converter_order(converters)
+        for converter_config in converters:
+            model_config = converter_config.build().convert(model_config)
     return ModelSpec(
         name="rwkv7",
         flavor=flavor,

@@ -15,7 +15,7 @@ def test_torchtitan_entrypoints_and_revision_are_authoritative() -> None:
     ) in dependencies
     assert project["project"]["scripts"]["rwkv-train"] == "torchtitan.train:main"
     assert project["project"]["scripts"]["rwkv-convert-legacy-checkpoint"] == (
-        "rwkv_lm.models.rwkv7.state_dict_adapter:converter_main"
+        "transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf:main"
     )
 
 
