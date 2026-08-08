@@ -120,6 +120,13 @@ class RwkvModelAdapter(BaseModel):
         model = self.rwkv_model
         model.model.reset_parameters()
         model.reset_head_parameters()
+        if self.config.peft.enabled:
+            from peft.tuners.lora import LoraLayer
+
+            for module in self.hf_model.modules():
+                if isinstance(module, LoraLayer):
+                    for adapter_name in module.lora_A:
+                        module.reset_lora_parameters(adapter_name, init_lora_weights=True)
 
     def forward(self, tokens: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         kwargs.pop("positions", None)

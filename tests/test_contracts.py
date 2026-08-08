@@ -124,6 +124,31 @@ def test_peft_trains_only_four_attention_projection_families(tmp_path: Path) -> 
     assert optimized == set(trainable)
 
 
+def test_meta_peft_initialization_restores_lora_defaults(tmp_path: Path) -> None:
+    pytest.importorskip("peft")
+    config = RwkvModelAdapter.Config(
+        hf_assets_path=str(_assets(tmp_path)),
+        peft=PeftSettings(enabled=True),
+    )
+    with torch.device("meta"):
+        model = config.build()
+    model.to_empty(device="cpu")
+    model.init_states()
+    lora_a = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and ".lora_A." in name
+    ]
+    lora_b = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and ".lora_B." in name
+    ]
+    assert lora_a and all(torch.isfinite(parameter).all() for parameter in lora_a)
+    assert all(torch.count_nonzero(parameter) > 0 for parameter in lora_a)
+    assert lora_b and all(torch.count_nonzero(parameter) == 0 for parameter in lora_b)
+
+
 def test_binidx_cursor_round_trip_and_identity_rejection(tmp_path: Path) -> None:
     prefix = tmp_path / "tokens"
     tokens = np.arange(34, dtype=np.uint16)
