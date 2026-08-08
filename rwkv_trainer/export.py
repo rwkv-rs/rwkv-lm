@@ -15,9 +15,11 @@ from .model import PeftSettings, RwkvModelAdapter
 from .provenance import dependency_metadata
 
 
-def _logits(model, tokens: torch.Tensor) -> torch.Tensor:
+def _logits(model, tokens: torch.Tensor, *, seed: int) -> torch.Tensor:
     model.train()
-    with torch.no_grad():
+    with torch.random.fork_rng(devices=[tokens.device]), torch.no_grad():
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         return model(input_ids=tokens, use_cache=False, return_dict=True).logits.float().cpu()
 
 
@@ -51,14 +53,16 @@ def export(args: argparse.Namespace) -> None:
         generator=torch.Generator(device=args.device).manual_seed(args.seed),
         device=args.device,
     )
-    expected = _logits(adapter.hf_model, tokens)
+    expected = _logits(adapter.hf_model, tokens, seed=args.seed)
     adapter_dir = output / "adapter"
     adapter.hf_model.save_pretrained(adapter_dir, safe_serialization=True)
     reloaded = PeftModel.from_pretrained(
         AutoModelForCausalLM.from_pretrained(args.base_model),
         adapter_dir,
     ).to(device=args.device, dtype=torch.bfloat16)
-    torch.testing.assert_close(_logits(reloaded, tokens), expected, atol=args.atol, rtol=args.rtol)
+    torch.testing.assert_close(
+        _logits(reloaded, tokens, seed=args.seed), expected, atol=args.atol, rtol=args.rtol
+    )
 
     if args.merge:
         merged = reloaded.merge_and_unload()
@@ -69,7 +73,10 @@ def export(args: argparse.Namespace) -> None:
             type(merged).from_pretrained(merged_dir).to(device=args.device, dtype=torch.bfloat16)
         )
         torch.testing.assert_close(
-            _logits(reloaded_merged, tokens), expected, atol=args.atol, rtol=args.rtol
+            _logits(reloaded_merged, tokens, seed=args.seed),
+            expected,
+            atol=args.atol,
+            rtol=args.rtol,
         )
 
     training_summary = None
