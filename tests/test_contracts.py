@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 from transformers import RwkvConfig
 
 from rwkv_trainer.binidx import RwkvDataLoader
@@ -21,6 +22,7 @@ from rwkv_trainer.model import PeftSettings, RwkvModelAdapter
 from rwkv_trainer.model_spec import model_registry
 from rwkv_trainer.optimizer import RwkvOptimizersContainer
 from rwkv_trainer.state_dict import RwkvStateDictAdapter
+from rwkv_trainer.trainer import RwkvTrainer
 from rwkv_trainer.validate import validate_tree
 
 
@@ -69,6 +71,7 @@ def test_all_torchtitan_registrations_are_available() -> None:
         "lora",
         "lora_infctx",
     ]
+    assert rwkv7_debug()._owner is RwkvTrainer
     with pytest.raises(ValueError, match="Unknown RWKV flavor"):
         model_registry("0.4B")
 
@@ -111,6 +114,14 @@ def test_peft_trains_only_four_attention_projection_families(tmp_path: Path) -> 
         "value",
         "output",
     }
+    optimizer = RwkvOptimizersContainer.Config(implementation="for-loop").build(model_parts=[model])
+    optimized = {
+        name
+        for inner in optimizer.optimizers
+        for group in inner.param_groups
+        for name in group["param_names"]
+    }
+    assert optimized == set(trainable)
 
 
 def test_binidx_cursor_round_trip_and_identity_rejection(tmp_path: Path) -> None:
@@ -155,6 +166,31 @@ def test_binidx_cursor_round_trip_and_identity_rejection(tmp_path: Path) -> None
     )
     with pytest.raises(ValueError, match="identity mismatch"):
         changed.load_state_dict(state)
+
+
+def test_dcp_round_trip_restores_cursor(tmp_path: Path) -> None:
+    config = RwkvDataLoader.Config(dataset="synthetic", vocab_size=64)
+    loader = RwkvDataLoader(
+        config,
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=object(),
+        seq_len=4,
+        local_batch_size=1,
+    )
+    next(iter(loader))
+    checkpoint = tmp_path / "dcp"
+    dcp.save({"dataloader": loader}, checkpoint_id=str(checkpoint))
+    resumed = RwkvDataLoader(
+        config,
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=object(),
+        seq_len=4,
+        local_batch_size=1,
+    )
+    dcp.load({"dataloader": resumed}, checkpoint_id=str(checkpoint))
+    assert resumed.cursor == loader.cursor == 1
 
 
 class _OptimizerFixture(torch.nn.Module):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import spmd_types as spmd
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -12,6 +14,10 @@ from .model import RwkvModelAdapter
 
 
 class RwkvTrainer(Trainer):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Trainer.Config):
+        pass
+
     def forward_backward_step(
         self,
         *,
