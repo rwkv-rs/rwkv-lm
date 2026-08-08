@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rwkv-trainer"
+version = "0.1.0a0"
+description = "Thin TorchTitan extension for canonical Transformers RWKV-7 models"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+authors = [{name = "Caizus", email = "18930215187@163.com"}]
+dependencies = [
+  "flashrwkv2 @ git+https://github.com/rwkv-rs/FlashRWKV2.git@8494189a426f1cfec3e623a46efb81627bef64be",
+  "numpy>=1.26",
+  "peft==0.18.0",
+  "safetensors>=0.4",
+  "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python",
+  "torchtitan @ git+https://github.com/pytorch/torchtitan.git@96276d86577cf3e3bd29de72586e76af62010a55",
+  "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@fe9df14d52d96ead6a5c9e03e49d3076d3ece01a",
+]
+
+[project.scripts]
+rwkv-train = "rwkv_trainer.cli:train"
+rwkv-export = "rwkv_trainer.export:main"
+rwkv-validate = "rwkv_trainer.validate:main"
+
+[project.optional-dependencies]
+dev = ["pyright>=1.1.400", "pytest>=8", "ruff>=0.12", "shellcheck-py>=0.10"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["rwkv_trainer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+include = ["rwkv_trainer"]
+reportMissingImports = false
+
+[tool.uv]
+override-dependencies = ["transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@fe9df14d52d96ead6a5c9e03e49d3076d3ece01a"]
