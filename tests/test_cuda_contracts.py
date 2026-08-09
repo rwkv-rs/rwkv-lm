@@ -153,7 +153,7 @@ def test_canonical_artifact_adapter_forward_matches_direct_hf() -> None:
     adapter.to_empty(device="cuda")
     adapter = adapter.to(torch.bfloat16).train()
     adapter.rwkv_model.load_state_dict(direct.state_dict())
-    tokens = torch.tensor([[17]], device="cuda", dtype=torch.long)
+    tokens = torch.arange(16, device="cuda", dtype=torch.long).unsqueeze(0)
     with torch.no_grad():
         direct_logits = direct(input_ids=tokens, use_cache=False, return_dict=True).logits
         adapter_logits = adapter(tokens)
