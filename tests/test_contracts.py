@@ -271,12 +271,21 @@ def test_optimizer_checkpoint_materializes_unused_parameter_state(tmp_path: Path
         if parameter is not target:
             parameter.grad = torch.zeros_like(parameter)
     optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+    saved_grads = {
+        name: parameter.grad
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
 
     state = optimizer.state_dict()
 
     assert f"state.{target_name}.step" in state
     assert state[f"state.{target_name}.step"].item() == 0
+    assert all(
+        dict(model.named_parameters())[name].grad is gradient
+        for name, gradient in saved_grads.items()
+    )
+    assert target.grad is None
     restored = RwkvOptimizersContainer.Config(implementation="for-loop").build(model_parts=[model])
     restored.load_state_dict(state)
     assert len(restored.optimizers[0].state) == sum(

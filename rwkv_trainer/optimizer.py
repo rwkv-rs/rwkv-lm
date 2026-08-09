@@ -90,16 +90,17 @@ class RwkvOptimizersContainer(OptimizersContainer):
         ]
         if not missing:
             return
-        if any(
-            parameter.grad is not None
-            for group in optimizer.param_groups
-            for parameter in group["params"]
-        ):
-            raise RuntimeError(
-                "RWKV optimizer state may be materialized only at a zero-grad step boundary."
-            )
+        parameters = [
+            parameter for group in optimizer.param_groups for parameter in group["params"]
+        ]
+        saved_grads = [parameter.grad for parameter in parameters]
         saved_lrs = [group["lr"] for group in optimizer.param_groups]
         try:
+            # TorchTitan checkpoints immediately after optimizer.step(), before
+            # clearing the completed step's gradients. Hide those gradients so
+            # this synthetic step touches only parameters with lazy state.
+            for parameter in parameters:
+                parameter.grad = None
             for group in optimizer.param_groups:
                 group["lr"] = 0.0
             for parameter in missing:
@@ -112,8 +113,8 @@ class RwkvOptimizersContainer(OptimizersContainer):
                 elif step is not None:
                     optimizer.state[parameter]["step"] = 0
         finally:
-            for parameter in missing:
-                parameter.grad = None
+            for parameter, gradient in zip(parameters, saved_grads, strict=True):
+                parameter.grad = gradient
             for group, lr in zip(optimizer.param_groups, saved_lrs, strict=True):
                 group["lr"] = lr
 
