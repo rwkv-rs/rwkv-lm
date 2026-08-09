@@ -74,6 +74,9 @@ def parallelize_rwkv(
         fully_shard(block, **fsdp_kwargs, reshard_after_forward=reshard)
     fully_shard(rwkv.model, **fsdp_kwargs, reshard_after_forward=reshard)
     fully_shard(rwkv, **fsdp_kwargs, reshard_after_forward=reshard)
+    # TorchTitan invokes the adapter, not its nested HF model. Mark the adapter
+    # as the FSDP root so its pre-forward hook coordinates all nested unshards.
+    fully_shard(model, **fsdp_kwargs, reshard_after_forward=reshard)
     return model
 
 

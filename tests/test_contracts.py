@@ -179,6 +179,51 @@ def test_single_rank_parallelize_skips_fsdp_without_active_dp_mesh(
     assert not sharded
 
 
+def test_fsdp_marks_adapter_as_outermost_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = RwkvModelAdapter(RwkvModelAdapter.Config(hf_assets_path=str(_assets(tmp_path))))
+    sharded: list[torch.nn.Module] = []
+
+    def record_shard(module, **kwargs) -> None:
+        del kwargs
+        sharded.append(module)
+
+    monkeypatch.setattr("rwkv_trainer.parallelize.fully_shard", record_shard)
+    mesh = object()
+    monkeypatch.setattr(
+        "rwkv_trainer.parallelize.resolve_fsdp_mesh", lambda parallel_dims: (mesh, None)
+    )
+    parallel_dims = SimpleNamespace(
+        tp_enabled=False,
+        pp_enabled=False,
+        cp_enabled=False,
+        ep_enabled=False,
+        dp_replicate_enabled=False,
+        dp_shard_enabled=True,
+    )
+    parallelism = SimpleNamespace(spmd_backend="full_dtensor", fsdp_reshard_after_forward="default")
+    training = SimpleNamespace(
+        mixed_precision_param="bfloat16",
+        mixed_precision_reduce="float32",
+        enable_cpu_offload=False,
+    )
+    compile_config = SimpleNamespace(enable=False, components=[])
+    result = parallelize_rwkv(
+        model,
+        parallel_dims=parallel_dims,  # type: ignore[arg-type]
+        training=training,  # type: ignore[arg-type]
+        parallelism=parallelism,  # type: ignore[arg-type]
+        compile_config=compile_config,  # type: ignore[arg-type]
+        ac_config=None,
+        dump_folder=str(tmp_path),
+    )
+    assert result is model
+    assert sharded[-1] is model
+    assert sharded[-2] is model.rwkv_model
+    assert sharded[-3] is model.rwkv_model.model
+
+
 def test_state_dict_adapter_only_changes_outer_prefix(tmp_path: Path) -> None:
     config = RwkvModelAdapter.Config(hf_assets_path=str(_assets(tmp_path)))
     adapter = RwkvStateDictAdapter(config, str(tmp_path))
