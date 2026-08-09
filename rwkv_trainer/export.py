@@ -26,6 +26,15 @@ def _logits(model, tokens: torch.Tensor, *, seed: int) -> torch.Tensor:
         return model(input_ids=tokens, use_cache=False, return_dict=True).logits.float().cpu()
 
 
+def _inference_logits(model, tokens: torch.Tensor, *, seed: int) -> torch.Tensor:
+    model.prepare_for_inference()
+    model.eval()
+    with torch.random.fork_rng(devices=[tokens.device]), torch.no_grad():
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        return model(input_ids=tokens, use_cache=False, return_dict=True).logits.float().cpu()
+
+
 def _require_uniform_floating_dtype(model, dtype: torch.dtype) -> None:
     mismatches = [
         f"parameter {name}={parameter.dtype}"
@@ -121,7 +130,21 @@ def export(args: argparse.Namespace) -> None:
     )
 
     if args.merge:
-        merged = reloaded.merge_and_unload()
+        # Merge in FP32 so LoRA deltas smaller than a BF16 base-weight ULP are
+        # not discarded. The canonical inference provider consumes FP16 model
+        # weights (with BF16 embeddings), so store the standalone artifact in
+        # FP16 and validate it through that public path.
+        merge_source = PeftModel.from_pretrained(
+            AutoModelForCausalLM.from_pretrained(
+                args.base_model,
+                local_files_only=True,
+                dtype=torch.float32,
+            ),
+            adapter_dir,
+            local_files_only=True,
+        )
+        _require_uniform_floating_dtype(merge_source, torch.float32)
+        merged = merge_source.merge_and_unload().to(dtype=torch.float16)
         merged_dir = output / "merged"
         merged.save_pretrained(merged_dir, safe_serialization=True)
         AutoTokenizer.from_pretrained(args.base_model, local_files_only=True).save_pretrained(
@@ -130,11 +153,10 @@ def export(args: argparse.Namespace) -> None:
         reloaded_merged = AutoModelForCausalLM.from_pretrained(
             merged_dir,
             local_files_only=True,
-            dtype=torch.bfloat16,
-        ).to(device=args.device, dtype=torch.bfloat16)
-        _require_uniform_floating_dtype(reloaded_merged, torch.bfloat16)
+            dtype=torch.float16,
+        ).to(device=args.device)
         torch.testing.assert_close(
-            _logits(reloaded_merged, tokens, seed=args.seed),
+            _inference_logits(reloaded_merged, tokens, seed=args.seed),
             expected,
             atol=args.atol,
             rtol=args.rtol,
@@ -156,7 +178,14 @@ def export(args: argparse.Namespace) -> None:
             "target_modules": args.target_modules,
         },
         "training_config": training_summary,
-        "validation": {"seed": args.seed, "atol": args.atol, "rtol": args.rtol},
+        "validation": {
+            "seed": args.seed,
+            "atol": args.atol,
+            "rtol": args.rtol,
+            "adapter_compute_dtype": "bfloat16",
+            "merged_storage_dtype": "float16",
+            "merged_validation_path": "prepare_for_inference",
+        },
     }
     (output / "rwkv_training_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
