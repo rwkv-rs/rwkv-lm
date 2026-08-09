@@ -22,7 +22,7 @@ from rwkv_trainer.config_registry import (
     rwkv7_pretrain,
     rwkv7_pretrain_infctx,
 )
-from rwkv_trainer.export import _dcp_model_state
+from rwkv_trainer.export import _dcp_model_state, _require_uniform_floating_dtype
 from rwkv_trainer.model import PeftSettings, RwkvModelAdapter
 from rwkv_trainer.model_spec import model_registry
 from rwkv_trainer.optimizer import RwkvOptimizersContainer
@@ -532,3 +532,12 @@ def test_export_maps_canonical_and_activation_checkpoint_keys(tmp_path: Path) ->
     assert artifact_hashes(artifact) == {
         "config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
     }
+
+
+def test_export_rejects_mixed_floating_dtypes() -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2).to(torch.bfloat16))
+    model.register_buffer("fp32_buffer", torch.ones(1))
+    with pytest.raises(TypeError, match=r"buffer fp32_buffer=torch.float32"):
+        _require_uniform_floating_dtype(model, torch.bfloat16)
+    model.fp32_buffer = model.fp32_buffer.to(torch.bfloat16)
+    _require_uniform_floating_dtype(model, torch.bfloat16)

@@ -23,8 +23,23 @@ def _logits(model, tokens: torch.Tensor, *, seed: int) -> torch.Tensor:
     with torch.random.fork_rng(devices=[tokens.device]), torch.no_grad():
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        with torch.autocast(device_type=tokens.device.type, dtype=torch.bfloat16):
-            return model(input_ids=tokens, use_cache=False, return_dict=True).logits.float().cpu()
+        return model(input_ids=tokens, use_cache=False, return_dict=True).logits.float().cpu()
+
+
+def _require_uniform_floating_dtype(model, dtype: torch.dtype) -> None:
+    mismatches = [
+        f"parameter {name}={parameter.dtype}"
+        for name, parameter in model.named_parameters()
+        if parameter.is_floating_point() and parameter.dtype != dtype
+    ]
+    mismatches.extend(
+        f"buffer {name}={buffer.dtype}"
+        for name, buffer in model.named_buffers()
+        if buffer.is_floating_point() and buffer.dtype != dtype
+    )
+    if mismatches:
+        preview = ", ".join(mismatches[:5])
+        raise TypeError(f"RWKV export validation requires uniform {dtype}: {preview}")
 
 
 def _dcp_model_state(
@@ -77,6 +92,7 @@ def export(args: argparse.Namespace) -> None:
     # FP16) while LoRA tensors follow the BF16 training policy. FSDP normally
     # normalizes both for compute; the standalone exporter must do so itself.
     adapter.to(device=args.device, dtype=torch.bfloat16)
+    _require_uniform_floating_dtype(adapter, torch.bfloat16)
     if not isinstance(adapter.hf_model, PeftModel):
         raise TypeError("Expected PEFT-wrapped model during adapter export.")
 
