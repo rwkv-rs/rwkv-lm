@@ -36,7 +36,15 @@ class RwkvTrainer(Trainer):
             raise NotImplementedError("RWKV infctx does not support pipeline parallelism.")
         if not isinstance(input_dict, dict) or not isinstance(labels, torch.Tensor):
             raise TypeError("RWKV infctx expects one non-pipeline microbatch.")
-        tokens, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
+        processed_tokens, processed_labels, extra_kwargs = self.post_dataloading_process(
+            input_dict, labels
+        )
+        if not isinstance(processed_tokens, torch.Tensor) or not isinstance(
+            processed_labels, torch.Tensor
+        ):
+            raise TypeError("RWKV infctx post-processing must return tensor tokens and labels.")
+        tokens = processed_tokens
+        tensor_labels = processed_labels
         extra_kwargs.pop("positions", None)
         if extra_kwargs:
             raise TypeError(f"RWKV infctx received unsupported inputs: {sorted(extra_kwargs)}")
@@ -47,9 +55,10 @@ class RwkvTrainer(Trainer):
                 "chunk_ctx must be positive and no greater than logical length "
                 f"{logical_length}, got {chunk_ctx}."
             )
-        if tokens.shape != labels.shape:
+        if tokens.shape != tensor_labels.shape:
             raise ValueError(
-                f"RWKV infctx input/label shapes must match, got {tokens.shape} and {labels.shape}."
+                "RWKV infctx input/label shapes must match, got "
+                f"{tokens.shape} and {tensor_labels.shape}."
             )
         model = self.model_parts[0]
         if not isinstance(model, RwkvModelAdapter):
@@ -84,7 +93,9 @@ class RwkvTrainer(Trainer):
                     preserve_rng_state=True,
                 )
                 logits, *next_tensors = result
-                chunk_loss, _ = self.loss_fn(logits, labels[:, start:end], global_valid_tokens)
+                chunk_loss, _ = self.loss_fn(
+                    logits, tensor_labels[:, start:end], global_valid_tokens
+                )
                 with spmd.no_typecheck():
                     chunk_loss.backward()
                 accumulated += chunk_loss.detach()
