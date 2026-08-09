@@ -180,10 +180,16 @@ def test_single_rank_parallelize_skips_fsdp_without_active_dp_mesh(
     assert not sharded
 
 
-def test_fsdp_marks_adapter_as_outermost_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("peft_enabled", [False, True])
+def test_fsdp_marks_only_forward_aligned_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peft_enabled: bool
 ) -> None:
-    model = RwkvModelAdapter(RwkvModelAdapter.Config(hf_assets_path=str(_assets(tmp_path))))
+    model = RwkvModelAdapter(
+        RwkvModelAdapter.Config(
+            hf_assets_path=str(_assets(tmp_path)),
+            peft=PeftSettings(enabled=peft_enabled),
+        )
+    )
     sharded: list[torch.nn.Module] = []
 
     def record_shard(module, **kwargs) -> None:
@@ -223,8 +229,12 @@ def test_fsdp_marks_adapter_as_outermost_root(
     assert model.rwkv_model.model.blocks[0] not in sharded
     assert all(block in sharded for block in model.rwkv_model.model.blocks[1:])
     assert sharded[-1] is model
-    assert sharded[-2] is model.rwkv_model
-    assert sharded[-3] is model.rwkv_model.model
+    assert (model.rwkv_model in sharded) is not peft_enabled
+    if peft_enabled:
+        assert sharded[-2] is model.rwkv_model.model
+    else:
+        assert sharded[-2] is model.rwkv_model
+        assert sharded[-3] is model.rwkv_model.model
 
 
 def test_state_dict_adapter_only_changes_outer_prefix(tmp_path: Path) -> None:

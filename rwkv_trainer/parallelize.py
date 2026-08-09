@@ -76,7 +76,11 @@ def parallelize_rwkv(
     for block in rwkv.model.blocks[1:]:
         fully_shard(block, **fsdp_kwargs, reshard_after_forward=reshard)
     fully_shard(rwkv.model, **fsdp_kwargs, reshard_after_forward=reshard)
-    fully_shard(rwkv, **fsdp_kwargs, reshard_after_forward=reshard)
+    # PEFT's tuner calls the wrapped model's ``forward`` method directly, so a
+    # pre-forward hook attached to RwkvForCausalLM would never run. In PEFT
+    # mode, leave its head and other remaining parameters to the adapter root.
+    if not model.config.peft.enabled:
+        fully_shard(rwkv, **fsdp_kwargs, reshard_after_forward=reshard)
     # TorchTitan invokes the adapter, not its nested HF model. Mark the adapter
     # as the FSDP root so its pre-forward hook coordinates all nested unshards.
     fully_shard(model, **fsdp_kwargs, reshard_after_forward=reshard)
