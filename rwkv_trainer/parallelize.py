@@ -70,7 +70,10 @@ def parallelize_rwkv(
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
     reshard = parallelism.fsdp_reshard_after_forward != "never"
 
-    for block in rwkv.model.blocks:
+    # RwkvModel.forward reads blocks[0].ln0 before calling block 0 itself.
+    # Keep block 0 under the RwkvModel FSDP unit so that access occurs inside
+    # its owning module's forward; blocks 1..N-1 are forward-aligned units.
+    for block in rwkv.model.blocks[1:]:
         fully_shard(block, **fsdp_kwargs, reshard_after_forward=reshard)
     fully_shard(rwkv.model, **fsdp_kwargs, reshard_after_forward=reshard)
     fully_shard(rwkv, **fsdp_kwargs, reshard_after_forward=reshard)

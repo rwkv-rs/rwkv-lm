@@ -219,6 +219,8 @@ def test_fsdp_marks_adapter_as_outermost_root(
         dump_folder=str(tmp_path),
     )
     assert result is model
+    assert model.rwkv_model.model.blocks[0] not in sharded
+    assert all(block in sharded for block in model.rwkv_model.model.blocks[1:])
     assert sharded[-1] is model
     assert sharded[-2] is model.rwkv_model
     assert sharded[-3] is model.rwkv_model.model
