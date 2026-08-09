@@ -22,11 +22,12 @@ from rwkv_trainer.config_registry import (
     rwkv7_pretrain,
     rwkv7_pretrain_infctx,
 )
+from rwkv_trainer.export import _dcp_model_state
 from rwkv_trainer.model import PeftSettings, RwkvModelAdapter
 from rwkv_trainer.model_spec import model_registry
 from rwkv_trainer.optimizer import RwkvOptimizersContainer
 from rwkv_trainer.parallelize import parallelize_rwkv
-from rwkv_trainer.provenance import dependency_metadata
+from rwkv_trainer.provenance import artifact_hashes, dependency_metadata
 from rwkv_trainer.state_dict import RwkvStateDictAdapter
 from rwkv_trainer.trainer import RwkvTrainer
 from rwkv_trainer.validate import validate_tree
@@ -474,10 +475,35 @@ def test_dependency_manifest_has_no_floating_main() -> None:
     assert dependency_metadata() == {
         "torchtitan_oid": "96276d86577cf3e3bd29de72586e76af62010a55",
         "transformers_oid": "10052072bd3ca172957d97e11b24ae297e0e0072",
+        "tokenizers_oid": "c5d8dde5ff49c70e4656199d5033a84e03c21b2b",
         "flashrwkv2_version": "0.1.0a5",
         "flashrwkv2_oid": "046257e7918d93a0fefce868e2ab580fbf6078da",
         "peft_version": "0.18.0",
+        "peft_oid": "abefcce659b892b42271831504b66f3f2340b655",
         "rwkv_peft_reference_oid": "5704c39f8ab1d2ac63936ab392aadb6ba526e1a5",
     }
     metadata = json.loads(json.dumps(model_registry("pretrain").model.to_dict()))
     assert "hf_assets_path" in metadata
+
+
+def test_export_maps_canonical_and_activation_checkpoint_keys(tmp_path: Path) -> None:
+    tensors = {
+        "hf_model.model.blocks.0.att.key.weight": torch.ones(1),
+        "hf_model.head.weight": torch.ones(1),
+    }
+    source_keys = {
+        "hf_model.model.blocks.0._checkpoint_wrapped_module.att.key.weight",
+        "hf_model.head.weight",
+    }
+    mapped = _dcp_model_state(tensors, source_keys)
+    assert set(mapped) == source_keys
+    assert mapped["hf_model.head.weight"] is tensors["hf_model.head.weight"]
+    with pytest.raises(KeyError, match="does not contain"):
+        _dcp_model_state(tensors, {"hf_model.head.weight"})
+
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    (artifact / "config.json").write_text("{}")
+    assert artifact_hashes(artifact) == {
+        "config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    }
