@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,6 +24,7 @@ from rwkv_trainer.config_registry import (
 from rwkv_trainer.model import PeftSettings, RwkvModelAdapter
 from rwkv_trainer.model_spec import model_registry
 from rwkv_trainer.optimizer import RwkvOptimizersContainer
+from rwkv_trainer.parallelize import parallelize_rwkv
 from rwkv_trainer.provenance import dependency_metadata
 from rwkv_trainer.state_dict import RwkvStateDictAdapter
 from rwkv_trainer.trainer import RwkvTrainer
@@ -123,6 +125,40 @@ def test_canonical_initialization_supports_fsdp_dtensors(tmp_path: Path) -> None
         )
     finally:
         dist.destroy_process_group()
+
+
+def test_single_rank_parallelize_skips_fsdp_without_active_dp_mesh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = RwkvModelAdapter(RwkvModelAdapter.Config(hf_assets_path=str(_assets(tmp_path))))
+    sharded = False
+
+    def record_shard(*args, **kwargs) -> None:
+        del args, kwargs
+        nonlocal sharded
+        sharded = True
+
+    monkeypatch.setattr("rwkv_trainer.parallelize.fully_shard", record_shard)
+    parallel_dims = SimpleNamespace(
+        tp_enabled=False,
+        pp_enabled=False,
+        cp_enabled=False,
+        ep_enabled=False,
+        dp_replicate_enabled=False,
+        dp_shard_enabled=False,
+    )
+    compile_config = SimpleNamespace(enable=False, components=[])
+    result = parallelize_rwkv(
+        model,
+        parallel_dims=parallel_dims,  # type: ignore[arg-type]
+        training=SimpleNamespace(),  # type: ignore[arg-type]
+        parallelism=SimpleNamespace(),  # type: ignore[arg-type]
+        compile_config=compile_config,  # type: ignore[arg-type]
+        ac_config=None,
+        dump_folder=str(tmp_path),
+    )
+    assert result is model
+    assert not sharded
 
 
 def test_state_dict_adapter_only_changes_outer_prefix(tmp_path: Path) -> None:

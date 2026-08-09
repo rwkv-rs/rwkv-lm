@@ -45,6 +45,13 @@ def parallelize_rwkv(
                 block, base_fqn=f"hf_model.model.blocks.{index}"
             )
 
+    # A one-rank run has no active data-parallel mesh. Applying fully_shard in
+    # that case leaves DTensor parameters without an FSDP root hook to unshard
+    # them before the nested HF model forward. Single-GPU correctness runs do
+    # not need FSDP; real multi-rank DP runs continue through the policy below.
+    if not (parallel_dims.dp_replicate_enabled or parallel_dims.dp_shard_enabled):
+        return model
+
     if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     else:
