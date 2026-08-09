@@ -23,7 +23,8 @@ def _logits(model, tokens: torch.Tensor, *, seed: int) -> torch.Tensor:
     with torch.random.fork_rng(devices=[tokens.device]), torch.no_grad():
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        return model(input_ids=tokens, use_cache=False, return_dict=True).logits.float().cpu()
+        with torch.autocast(device_type=tokens.device.type, dtype=torch.bfloat16):
+            return model(input_ids=tokens, use_cache=False, return_dict=True).logits.float().cpu()
 
 
 def _dcp_model_state(
