@@ -235,6 +235,21 @@ def test_state_dict_adapter_only_changes_outer_prefix(tmp_path: Path) -> None:
     assert native == {"hf_model.model.emb.weight": tensor}
     assert adapter.to_hf(native) == {"model.emb.weight": tensor}
 
+    peft_config = RwkvModelAdapter.Config(
+        hf_assets_path=str(tmp_path), peft=PeftSettings(enabled=True)
+    )
+    peft_adapter = RwkvStateDictAdapter(peft_config, str(tmp_path))
+    hf_state = {
+        "model.blocks.0.att.key.weight": tensor,
+        "model.blocks.0.att.gate.weight": tensor,
+    }
+    peft_native = peft_adapter.from_hf(hf_state)
+    assert peft_native == {
+        "hf_model.base_model.model.model.blocks.0.att.key.base_layer.weight": tensor,
+        "hf_model.base_model.model.model.blocks.0.att.gate.weight": tensor,
+    }
+    assert peft_adapter.to_hf(peft_native) == hf_state
+
 
 def test_peft_trains_only_four_attention_projection_families(tmp_path: Path) -> None:
     pytest.importorskip("peft")
