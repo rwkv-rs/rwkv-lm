@@ -145,16 +145,16 @@ def test_canonical_artifact_adapter_forward_matches_direct_hf() -> None:
     direct = (
         RwkvForCausalLM.from_pretrained(artifact, local_files_only=True, dtype=torch.bfloat16)
         .cuda()
-        .eval()
+        .train()
     )
     adapter_config = RwkvModelAdapter.Config(hf_assets_path=str(artifact))
     with torch.device("meta"):
         adapter = adapter_config.build()
     adapter.to_empty(device="cuda")
-    adapter = adapter.to(torch.bfloat16).eval()
+    adapter = adapter.to(torch.bfloat16).train()
     adapter.rwkv_model.load_state_dict(direct.state_dict())
     tokens = torch.tensor([[17]], device="cuda", dtype=torch.long)
-    with torch.inference_mode():
+    with torch.no_grad():
         direct_logits = direct(input_ids=tokens, use_cache=False, return_dict=True).logits
         adapter_logits = adapter(tokens)
     torch.testing.assert_close(direct_logits, adapter_logits, atol=0, rtol=0)
