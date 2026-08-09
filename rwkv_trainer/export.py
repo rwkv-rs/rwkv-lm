@@ -19,7 +19,7 @@ _BLOCK_KEY = re.compile(r"(\.blocks\.\d+)(\.)")
 
 
 def _logits(model, tokens: torch.Tensor, *, seed: int) -> torch.Tensor:
-    model.eval()
+    model.train()
     with torch.random.fork_rng(devices=[tokens.device]), torch.no_grad():
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
