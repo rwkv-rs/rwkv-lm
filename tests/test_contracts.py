@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -127,6 +128,19 @@ def test_canonical_initialization_supports_fsdp_dtensors(tmp_path: Path) -> None
         assert torch.count_nonzero(
             model.rwkv_model.model.blocks[0].att.receptance.weight.full_tensor()
         )
+        assert hasattr(dist, "set_timeout")
+
+        class TimeoutGroup:
+            timeout: timedelta | None = None
+
+            def set_timeout(self, timeout: timedelta) -> None:
+                self.timeout = timeout
+
+        timeout_group = TimeoutGroup()
+        dist.set_timeout(  # type: ignore[attr-defined, arg-type]
+            timedelta(seconds=10), timeout_group
+        )
+        assert timeout_group.timeout == timedelta(seconds=10)
     finally:
         dist.destroy_process_group()
 
