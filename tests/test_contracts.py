@@ -91,6 +91,10 @@ def test_meta_build_and_canonical_initialization(tmp_path: Path) -> None:
     model.init_states()
     assert not any(parameter.is_meta for parameter in model.parameters())
     assert torch.count_nonzero(model.rwkv_model.model.blocks[0].att.output.weight) == 0
+    nparams, flops_per_token = config.get_nparams_and_flops(model, seq_len=16)
+    assert nparams == sum(parameter.numel() for parameter in model.parameters())
+    assert flops_per_token == 6 * (nparams - model.rwkv_model.model.emb.weight.numel())
+    assert flops_per_token > 0
 
 
 def test_canonical_initialization_supports_fsdp_dtensors(tmp_path: Path) -> None:

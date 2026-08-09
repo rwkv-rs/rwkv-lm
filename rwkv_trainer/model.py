@@ -98,7 +98,17 @@ class RwkvModelAdapter(BaseModel):
         def get_nparams_and_flops(self, model: BaseModel, seq_len: int) -> tuple[int, int]:
             del seq_len
             count = sum(parameter.numel() for parameter in model.parameters())
-            return count, 0
+            if not isinstance(model, RwkvModelAdapter):
+                raise TypeError(
+                    "RWKV parameter/FLOP accounting requires RwkvModelAdapter, "
+                    f"got {type(model).__name__}."
+                )
+            embedding_count = model.rwkv_model.model.emb.weight.numel()
+            # TorchTitan counts one forward and two backward matmuls, with two
+            # FLOPs per multiply-add. RWKV is linear in sequence length, so it
+            # has no Transformer attention term proportional to seq_len.
+            flops_per_token = 6 * (count - embedding_count)
+            return count, flops_per_token
 
     def __init__(self, config: Config):
         super().__init__()
