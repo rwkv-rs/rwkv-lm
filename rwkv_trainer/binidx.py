@@ -179,7 +179,6 @@ class RwkvDataLoader(BaseDataLoader):
             "seed": self.config.seed,
             "magic_prime": self.config.magic_prime,
             "dp_world_size": self.dp_world_size,
-            "dp_rank": self.dp_rank,
             "seq_len": self.seq_len,
             "local_batch_size": self.local_batch_size,
         }

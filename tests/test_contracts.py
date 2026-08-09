@@ -387,6 +387,45 @@ def test_dcp_round_trip_restores_cursor(tmp_path: Path) -> None:
     assert resumed.cursor == loader.cursor == 1
 
 
+def test_dataloader_checkpoint_identity_is_shared_across_dp_ranks() -> None:
+    config = RwkvDataLoader.Config(dataset="synthetic", vocab_size=64)
+    rank_zero = RwkvDataLoader(
+        config,
+        dp_world_size=2,
+        dp_rank=0,
+        tokenizer=object(),
+        seq_len=4,
+        local_batch_size=1,
+    )
+    next(iter(rank_zero))
+    state = rank_zero.state_dict()
+    rank_one = RwkvDataLoader(
+        config,
+        dp_world_size=2,
+        dp_rank=1,
+        tokenizer=object(),
+        seq_len=4,
+        local_batch_size=1,
+    )
+
+    rank_one.load_state_dict(state)
+
+    assert rank_one.cursor == 1
+    expected = torch.randint(64, (1, 5), generator=torch.Generator().manual_seed(45))
+    actual = next(iter(rank_one))
+    torch.testing.assert_close(actual[0]["input"], expected[:, :-1])
+    different_world = RwkvDataLoader(
+        config,
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=object(),
+        seq_len=4,
+        local_batch_size=1,
+    )
+    with pytest.raises(ValueError, match="identity mismatch"):
+        different_world.load_state_dict(state)
+
+
 class _OptimizerFixture(torch.nn.Module):
     def __init__(self):
         super().__init__()
