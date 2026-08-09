@@ -114,7 +114,8 @@ def export(args: argparse.Namespace) -> None:
         ),
         adapter_dir,
         local_files_only=True,
-    ).to(device=args.device)
+    ).to(device=args.device, dtype=torch.bfloat16)
+    _require_uniform_floating_dtype(reloaded, torch.bfloat16)
     torch.testing.assert_close(
         _logits(reloaded, tokens, seed=args.seed), expected, atol=args.atol, rtol=args.rtol
     )
@@ -130,7 +131,8 @@ def export(args: argparse.Namespace) -> None:
             merged_dir,
             local_files_only=True,
             dtype=torch.bfloat16,
-        ).to(device=args.device)
+        ).to(device=args.device, dtype=torch.bfloat16)
+        _require_uniform_floating_dtype(reloaded_merged, torch.bfloat16)
         torch.testing.assert_close(
             _logits(reloaded_merged, tokens, seed=args.seed),
             expected,
