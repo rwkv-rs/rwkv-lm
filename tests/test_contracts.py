@@ -21,6 +21,7 @@ from rwkv_trainer.config_registry import (
 from rwkv_trainer.model import PeftSettings, RwkvModelAdapter
 from rwkv_trainer.model_spec import model_registry
 from rwkv_trainer.optimizer import RwkvOptimizersContainer
+from rwkv_trainer.provenance import dependency_metadata
 from rwkv_trainer.state_dict import RwkvStateDictAdapter
 from rwkv_trainer.trainer import RwkvTrainer
 from rwkv_trainer.validate import validate_tree
@@ -258,5 +259,17 @@ def test_launcher_ignores_hostile_generic_environment_names() -> None:
 def test_dependency_manifest_has_no_floating_main() -> None:
     manifest = (Path(__file__).parents[1] / "pyproject.toml").read_text()
     assert "@main" not in manifest
+    assert "10052072bd3ca172957d97e11b24ae297e0e0072" in manifest
+    assert "flashrwkv2==0.1.0a5" in manifest
+    lock = (Path(__file__).parents[1] / "uv.lock").read_text()
+    assert "sha256:bb8a565084addabf1071c06d398ac7f451919fb4cc3e30f314a8e1442124efdd" in lock
+    assert dependency_metadata() == {
+        "torchtitan_oid": "96276d86577cf3e3bd29de72586e76af62010a55",
+        "transformers_oid": "10052072bd3ca172957d97e11b24ae297e0e0072",
+        "flashrwkv2_version": "0.1.0a5",
+        "flashrwkv2_oid": "046257e7918d93a0fefce868e2ab580fbf6078da",
+        "peft_version": "0.18.0",
+        "rwkv_peft_reference_oid": "5704c39f8ab1d2ac63936ab392aadb6ba526e1a5",
+    }
     metadata = json.loads(json.dumps(model_registry("pretrain").model.to_dict()))
     assert "hf_assets_path" in metadata

@@ -11,13 +11,13 @@ requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
 authors = [{name = "Caizus", email = "18930215187@163.com"}]
 dependencies = [
-  "flashrwkv2 @ git+https://github.com/rwkv-rs/FlashRWKV2.git@8494189a426f1cfec3e623a46efb81627bef64be",
+  "flashrwkv2==0.1.0a5",
   "numpy>=1.26",
   "peft==0.18.0",
   "safetensors>=0.4",
   "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python",
   "torchtitan @ git+https://github.com/pytorch/torchtitan.git@96276d86577cf3e3bd29de72586e76af62010a55",
-  "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@fe9df14d52d96ead6a5c9e03e49d3076d3ece01a",
+  "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@10052072bd3ca172957d97e11b24ae297e0e0072",
 ]
 
 [project.scripts]
@@ -30,6 +30,9 @@ dev = ["pyright>=1.1.400", "pytest>=8", "ruff>=0.12", "shellcheck-py>=0.10"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["rwkv_trainer"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -47,4 +50,4 @@ include = ["rwkv_trainer"]
 reportMissingImports = false
 
 [tool.uv]
-override-dependencies = ["transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@fe9df14d52d96ead6a5c9e03e49d3076d3ece01a"]
+override-dependencies = ["transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@10052072bd3ca172957d97e11b24ae297e0e0072"]
