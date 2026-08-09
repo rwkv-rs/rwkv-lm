@@ -254,6 +254,7 @@ def test_launcher_ignores_hostile_generic_environment_names() -> None:
     assert "${CONFIG:-" not in script
     assert "RWKV_TORCHTITAN_MODULE" in script
     assert "RWKV_TORCHTITAN_CONFIG" in script
+    assert "RWKV_TORCHRUN:-${SCRIPT_DIR}/.venv/bin/torchrun" in script
 
 
 def test_dependency_manifest_has_no_floating_main() -> None:
