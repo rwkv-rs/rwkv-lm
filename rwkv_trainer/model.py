@@ -3,13 +3,71 @@
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any
 
 import torch
 from torch import nn
 from torchtitan.protocols import BaseModel
 from transformers import AutoConfig, AutoModelForCausalLM, RwkvConfig, RwkvForCausalLM
+
+
+@contextmanager
+def _canonical_dtensor_initializers():
+    """Make canonical Transformers/PEFT initializers DTensor-aware.
+
+    TorchTitan materializes parameters after applying FSDP2, so the targets are
+    DTensors while canonical initializers construct ordinary full tensors.  For
+    DTensor targets, initialize a full ordinary tensor with the provider's own
+    function, distribute it using the target layout, and copy it back.
+    """
+
+    from torch.distributed.tensor import DTensor, distribute_tensor
+    from transformers import initialization as hf_init
+
+    function_names = ("uniform_", "constant_", "ones_", "zeros_", "orthogonal_")
+    originals = {
+        (namespace, name): getattr(namespace, name)
+        for namespace in (hf_init, torch.nn.init)
+        for name in function_names
+    }
+    original_copy = hf_init.copy_
+
+    def wrap(initializer):
+        @wraps(initializer)
+        def dtensor_aware(tensor, *args, **kwargs):
+            if not isinstance(tensor, DTensor):
+                return initializer(tensor, *args, **kwargs)
+            full = torch.empty(tuple(tensor.shape), dtype=tensor.dtype, device=tensor.device)
+            initializer(full, *args, **kwargs)
+            distributed = distribute_tensor(full, tensor.device_mesh, tensor.placements)
+            with torch.no_grad():
+                tensor.copy_(distributed)
+            return tensor
+
+        return dtensor_aware
+
+    @wraps(original_copy)
+    def copy_dtensor_aware(tensor, other):
+        if not isinstance(tensor, DTensor):
+            return original_copy(tensor, other)
+        full = other.to(device=tensor.device, dtype=tensor.dtype)
+        distributed = distribute_tensor(full, tensor.device_mesh, tensor.placements)
+        with torch.no_grad():
+            tensor.copy_(distributed)
+        return tensor
+
+    try:
+        for (namespace, name), initializer in originals.items():
+            setattr(namespace, name, wrap(initializer))
+        hf_init.copy_ = copy_dtensor_aware
+        yield
+    finally:
+        hf_init.copy_ = original_copy
+        for (namespace, name), initializer in originals.items():
+            setattr(namespace, name, initializer)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -118,15 +176,16 @@ class RwkvModelAdapter(BaseModel):
     def init_states(self, *, buffer_device: torch.device | None = None) -> None:
         del buffer_device
         model = self.rwkv_model
-        model.model.reset_parameters()
-        model.reset_head_parameters()
-        if self.config.peft.enabled:
-            from peft.tuners.lora import LoraLayer
+        with _canonical_dtensor_initializers():
+            model.model.reset_parameters()
+            model.reset_head_parameters()
+            if self.config.peft.enabled:
+                from peft.tuners.lora import LoraLayer
 
-            for module in self.hf_model.modules():
-                if isinstance(module, LoraLayer):
-                    for adapter_name in module.lora_A:
-                        module.reset_lora_parameters(adapter_name, init_lora_weights=True)
+                for module in self.hf_model.modules():
+                    if isinstance(module, LoraLayer):
+                        for adapter_name in module.lora_A:
+                            module.reset_lora_parameters(adapter_name, init_lora_weights=True)
 
     def forward(self, tokens: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         kwargs.pop("positions", None)

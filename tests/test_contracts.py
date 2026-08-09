@@ -7,7 +7,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.tensor import DeviceMesh, Shard, distribute_tensor
 from transformers import RwkvConfig
 
 from rwkv_trainer.binidx import RwkvDataLoader
@@ -87,6 +89,40 @@ def test_meta_build_and_canonical_initialization(tmp_path: Path) -> None:
     model.init_states()
     assert not any(parameter.is_meta for parameter in model.parameters())
     assert torch.count_nonzero(model.rwkv_model.model.blocks[0].att.output.weight) == 0
+
+
+def test_canonical_initialization_supports_fsdp_dtensors(tmp_path: Path) -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    rendezvous = tmp_path / "dtensor-init"
+    dist.init_process_group("fake", rank=0, world_size=1, init_method=f"file://{rendezvous}")
+    try:
+        config = RwkvModelAdapter.Config(hf_assets_path=str(_assets(tmp_path)))
+        with torch.device("meta"):
+            model = config.build()
+        model.to_empty(device="cpu")
+        mesh = DeviceMesh("cpu", [0])
+        for module in model.modules():
+            for name, parameter in tuple(module.named_parameters(recurse=False)):
+                full = torch.empty(tuple(parameter.shape), dtype=parameter.dtype)
+                sharded = distribute_tensor(full, mesh, [Shard(0)])
+                setattr(
+                    module,
+                    name,
+                    torch.nn.Parameter(sharded, requires_grad=parameter.requires_grad),
+                )
+
+        model.init_states()
+
+        parameters = tuple(model.parameters())
+        assert parameters and all(parameter.isfinite().all() for parameter in parameters)
+        output = model.rwkv_model.model.blocks[0].att.output.weight.full_tensor()
+        assert torch.count_nonzero(output) == 0
+        assert torch.count_nonzero(
+            model.rwkv_model.model.blocks[0].att.receptance.weight.full_tensor()
+        )
+    finally:
+        dist.destroy_process_group()
 
 
 def test_state_dict_adapter_only_changes_outer_prefix(tmp_path: Path) -> None:

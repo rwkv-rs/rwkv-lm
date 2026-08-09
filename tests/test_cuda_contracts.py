@@ -141,6 +141,7 @@ def test_canonical_artifact_adapter_forward_matches_direct_hf() -> None:
     artifact_value = os.environ.get("RWKV7_HF_ARTIFACT")
     if not artifact_value:
         pytest.skip("set RWKV7_HF_ARTIFACT for the canonical checkpoint smoke")
+    assert artifact_value is not None
     artifact = Path(artifact_value)
     direct = (
         RwkvForCausalLM.from_pretrained(artifact, local_files_only=True, dtype=torch.bfloat16)
