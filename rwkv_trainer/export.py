@@ -72,6 +72,10 @@ def export(args: argparse.Namespace) -> None:
     checkpoint_state = _dcp_model_state(model_state, source_keys)
     dcp.load(checkpoint_state, storage_reader=reader)
     adapter.load_state_dict(model_state, strict=True)
+    # DCP preserves the base artifact's storage dtype (for this checkpoint,
+    # FP16) while LoRA tensors follow the BF16 training policy. FSDP normally
+    # normalizes both for compute; the standalone exporter must do so itself.
+    adapter.to(device=args.device, dtype=torch.bfloat16)
     if not isinstance(adapter.hf_model, PeftModel):
         raise TypeError("Expected PEFT-wrapped model during adapter export.")
 
