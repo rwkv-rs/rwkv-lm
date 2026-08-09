@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
@@ -77,6 +77,55 @@ class RwkvOptimizersContainer(OptimizersContainer):
             )
             patterns.append(key)
         return {config.optimizer_name: result}, {config.optimizer_name: patterns}
+
+    @staticmethod
+    def _initialize_missing_states(optimizer: torch.optim.Optimizer) -> None:
+        """Materialize states for parameters unused by the current RWKV step."""
+
+        missing = [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.requires_grad and not optimizer.state[parameter]
+        ]
+        if not missing:
+            return
+        if any(
+            parameter.grad is not None
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ):
+            raise RuntimeError(
+                "RWKV optimizer state may be materialized only at a zero-grad step boundary."
+            )
+        saved_lrs = [group["lr"] for group in optimizer.param_groups]
+        try:
+            for group in optimizer.param_groups:
+                group["lr"] = 0.0
+            for parameter in missing:
+                parameter.grad = torch.zeros_like(parameter)
+            optimizer.step()
+            for parameter in missing:
+                step = optimizer.state[parameter].get("step")
+                if isinstance(step, torch.Tensor):
+                    step.zero_()
+                elif step is not None:
+                    optimizer.state[parameter]["step"] = 0
+        finally:
+            for parameter in missing:
+                parameter.grad = None
+            for group, lr in zip(optimizer.param_groups, saved_lrs, strict=True):
+                group["lr"] = lr
+
+    def state_dict(self) -> dict[str, Any]:
+        for optimizer in self.optimizers:
+            self._initialize_missing_states(optimizer)
+        return super().state_dict()
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        for optimizer in self.optimizers:
+            self._initialize_missing_states(optimizer)
+        super().load_state_dict(state_dict)
 
 
 def rwkv_optimizer(*, lr: float, weight_decay: float = 0.01) -> RwkvOptimizersContainer.Config:

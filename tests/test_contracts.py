@@ -262,6 +262,28 @@ def test_peft_trains_only_four_attention_projection_families(tmp_path: Path) -> 
     assert optimized == set(trainable)
 
 
+def test_optimizer_checkpoint_materializes_unused_parameter_state(tmp_path: Path) -> None:
+    model = RwkvModelAdapter(RwkvModelAdapter.Config(hf_assets_path=str(_assets(tmp_path))))
+    optimizer = RwkvOptimizersContainer.Config(implementation="for-loop").build(model_parts=[model])
+    target_name = "hf_model.model.blocks.0.att.v0"
+    target = dict(model.named_parameters())[target_name]
+    for parameter in model.parameters():
+        if parameter is not target:
+            parameter.grad = torch.zeros_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    state = optimizer.state_dict()
+
+    assert f"state.{target_name}.step" in state
+    assert state[f"state.{target_name}.step"].item() == 0
+    restored = RwkvOptimizersContainer.Config(implementation="for-loop").build(model_parts=[model])
+    restored.load_state_dict(state)
+    assert len(restored.optimizers[0].state) == sum(
+        parameter.requires_grad for parameter in model.parameters()
+    )
+
+
 def test_meta_peft_initialization_restores_lora_defaults(tmp_path: Path) -> None:
     pytest.importorskip("peft")
     config = RwkvModelAdapter.Config(
