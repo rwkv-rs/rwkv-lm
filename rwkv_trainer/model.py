@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from torchtitan.protocols import BaseModel
+from torchtitan.protocols import BaseModel, Module
 from transformers import AutoConfig, AutoModelForCausalLM, RwkvConfig, RwkvForCausalLM
 
 
@@ -95,7 +95,7 @@ class RwkvModelAdapter(BaseModel):
             del kwargs
             self.hf_assets_path = config.hf_assets_path
 
-        def get_nparams_and_flops(self, model: BaseModel, seq_len: int) -> tuple[int, int]:
+        def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
             del seq_len
             count = sum(parameter.numel() for parameter in model.parameters())
             if not isinstance(model, RwkvModelAdapter):
@@ -103,7 +103,12 @@ class RwkvModelAdapter(BaseModel):
                     "RWKV parameter/FLOP accounting requires RwkvModelAdapter, "
                     f"got {type(model).__name__}."
                 )
-            embedding_count = model.rwkv_model.model.emb.weight.numel()
+            embedding = model.rwkv_model.model.emb
+            if not isinstance(embedding, nn.Embedding):
+                raise TypeError(
+                    "RWKV parameter/FLOP accounting requires an nn.Embedding input layer."
+                )
+            embedding_count = embedding.weight.numel()
             # TorchTitan counts one forward and two backward matmuls, with two
             # FLOPs per multiply-add. RWKV is linear in sequence length, so it
             # has no Transformer attention term proportional to seq_len.

@@ -7,10 +7,12 @@ import json
 import re
 import traceback
 from pathlib import Path
+from typing import Any, cast
 
 import torch
-import torch.distributed.checkpoint as dcp
 from peft import PeftModel
+from torch.distributed.checkpoint.filesystem import FileSystemReader
+from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .model import PeftSettings, RwkvModelAdapter
@@ -104,10 +106,10 @@ def _export(args: argparse.Namespace, output: Path) -> None:
         RwkvModelAdapter.Config(hf_assets_path=args.base_model, peft=settings)
     ).to(device=args.device, dtype=torch.bfloat16)
     model_state = adapter.state_dict()
-    reader = dcp.FileSystemReader(args.checkpoint)
+    reader = FileSystemReader(args.checkpoint)
     source_keys = set(reader.read_metadata().state_dict_metadata)
     checkpoint_state = _dcp_model_state(model_state, source_keys)
-    dcp.load(checkpoint_state, storage_reader=reader)
+    dcp_load(checkpoint_state, storage_reader=reader)
     adapter.load_state_dict(model_state, strict=True)
     # DCP preserves the base artifact's storage dtype (for this checkpoint,
     # FP16) while LoRA tensors follow the BF16 training policy. FSDP normally
@@ -126,7 +128,7 @@ def _export(args: argparse.Namespace, output: Path) -> None:
     )
     expected = _logits(adapter.hf_model, tokens, seed=args.seed)
     adapter_dir = output / "adapter"
-    adapter.hf_model.save_pretrained(adapter_dir, safe_serialization=True)
+    adapter.hf_model.save_pretrained(str(adapter_dir), safe_serialization=True)
     reloaded = PeftModel.from_pretrained(
         AutoModelForCausalLM.from_pretrained(
             args.base_model,
@@ -164,17 +166,21 @@ def _export(args: argparse.Namespace, output: Path) -> None:
             local_files_only=True,
         )
         _require_uniform_floating_dtype(merge_source, torch.float32)
-        merged = merge_source.merge_and_unload().to(dtype=torch.float16)
+        merged = cast(Any, merge_source).merge_and_unload().to(dtype=torch.float16)
         merged_dir = output / "merged"
-        merged.save_pretrained(merged_dir, safe_serialization=True)
+        merged.save_pretrained(str(merged_dir), safe_serialization=True)
         AutoTokenizer.from_pretrained(args.base_model, local_files_only=True).save_pretrained(
-            merged_dir
+            str(merged_dir)
         )
-        reloaded_merged = AutoModelForCausalLM.from_pretrained(
-            merged_dir,
-            local_files_only=True,
-            dtype=torch.float16,
-        ).to(device=args.device)
+        reloaded_merged = (
+            cast(Any, AutoModelForCausalLM)
+            .from_pretrained(
+                merged_dir,
+                local_files_only=True,
+                dtype=torch.float16,
+            )
+            .to(device=args.device)
+        )
         merged_inference_validation = _assert_logits_close(
             _inference_logits(reloaded_merged, tokens, seed=args.seed),
             unmerged_inference,

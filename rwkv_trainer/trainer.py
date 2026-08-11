@@ -8,7 +8,7 @@ import spmd_types as spmd
 import torch
 from torch.utils.checkpoint import checkpoint
 from torchtitan.trainer import Trainer
-from transformers import RwkvTrainingState
+from transformers import RwkvConfig, RwkvTrainingState
 
 from .model import RwkvModelAdapter
 
@@ -25,7 +25,10 @@ class RwkvTrainer(Trainer):
         labels: torch.Tensor | list[torch.Tensor],
         global_valid_tokens: float,
     ) -> torch.Tensor:
-        model_config = self.config.model_spec.model
+        model_spec = self.config.model_spec
+        if model_spec is None:
+            raise RuntimeError("RWKV trainer requires a registered model_spec.")
+        model_config = model_spec.model
         if not isinstance(model_config, RwkvModelAdapter.Config) or not model_config.infctx:
             return super().forward_backward_step(
                 input_dict=input_dict,
@@ -64,8 +67,11 @@ class RwkvTrainer(Trainer):
         if not isinstance(model, RwkvModelAdapter):
             raise TypeError(f"RWKV infctx expected RwkvModelAdapter, got {type(model).__name__}.")
         dtype = next(model.parameters()).dtype
+        hf_config = model.rwkv_model.config
+        if not isinstance(hf_config, RwkvConfig):
+            raise TypeError(f"RWKV infctx requires RwkvConfig, got {type(hf_config).__name__}.")
         state = RwkvTrainingState.zeros(
-            model.rwkv_model.config,
+            hf_config,
             tokens.shape[0],
             device=tokens.device,
             dtype=dtype,

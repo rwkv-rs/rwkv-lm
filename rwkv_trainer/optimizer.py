@@ -23,7 +23,6 @@ class RwkvOptimizersContainer(OptimizersContainer):
             raise ValueError(
                 "RWKV optimizer lr/eps must be positive and weight_decay non-negative."
             )
-        self._rwkv_config = config
         # Parent construction invokes the overridden shape-aware grouping method.
         config.param_groups = [
             ParamGroupConfig(
@@ -33,15 +32,21 @@ class RwkvOptimizersContainer(OptimizersContainer):
                     "lr": config.lr,
                     "betas": config.betas,
                     "eps": config.eps,
-                    "weight_decay": 0.0,
+                    "weight_decay": config.weight_decay,
                 },
             )
         ]
         super().__init__(config, model_parts=model_parts)
 
-    def _build_param_groups(self, model, param_group_configs, impl_kwargs):
-        del param_group_configs
-        config = self._rwkv_config
+    @staticmethod
+    def _build_param_groups(model, param_group_configs, impl_kwargs):
+        if len(param_group_configs) != 1:
+            raise ValueError("RWKV optimizer requires exactly one canonical parameter config.")
+        parameter_config = param_group_configs[0]
+        optimizer_kwargs = parameter_config.optimizer_kwargs
+        optimizer_name = parameter_config.optimizer_name
+        lr = optimizer_kwargs["lr"]
+        weight_decay = optimizer_kwargs["weight_decay"]
         groups = {"w0": [], "matrix": [], "other": []}
         names = {key: [] for key in groups}
         for name, parameter in model.named_parameters():
@@ -59,7 +64,7 @@ class RwkvOptimizersContainer(OptimizersContainer):
         patterns = []
         for key, lr_scale, decay in (
             ("w0", 2.0, 0.0),
-            ("matrix", 1.0, config.weight_decay),
+            ("matrix", 1.0, weight_decay),
             ("other", 1.0, 0.0),
         ):
             if not groups[key]:
@@ -69,14 +74,14 @@ class RwkvOptimizersContainer(OptimizersContainer):
                     "params": groups[key],
                     "param_names": names[key],
                     **impl_kwargs,
-                    "lr": config.lr * lr_scale,
-                    "betas": config.betas,
-                    "eps": config.eps,
+                    "lr": lr * lr_scale,
+                    "betas": optimizer_kwargs["betas"],
+                    "eps": optimizer_kwargs["eps"],
                     "weight_decay": decay,
                 }
             )
             patterns.append(key)
-        return {config.optimizer_name: result}, {config.optimizer_name: patterns}
+        return {optimizer_name: result}, {optimizer_name: patterns}
 
     @staticmethod
     def _initialize_missing_states(optimizer: torch.optim.Optimizer) -> None:

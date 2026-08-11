@@ -8,7 +8,7 @@ import struct
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import torch
@@ -91,7 +91,7 @@ class BinidxTokens:
 class RwkvDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
-        dataset: Literal["synthetic", "binidx"] = "synthetic"
+        dataset: str = "synthetic"
         vocab_size: int = 1024
         seed: int = 42
         magic_prime: int | None = None
@@ -123,7 +123,15 @@ class RwkvDataLoader(BaseDataLoader):
         self.seq_len = seq_len
         self.local_batch_size = local_batch_size
         self.cursor = 0
-        self.data = BinidxTokens(config.dataset_path) if config.dataset == "binidx" else None
+        if config.dataset not in {"synthetic", "binidx"}:
+            raise ValueError(f"unsupported RWKV dataset: {config.dataset}")
+        if config.dataset == "binidx" and config.dataset_path is None:
+            raise ValueError("binidx dataset requires dataset_path")
+        if config.dataset == "binidx":
+            assert config.dataset_path is not None
+            self.data = BinidxTokens(config.dataset_path)
+        else:
+            self.data = None
         if self.data is not None:
             slots = (self.data.identity["tokens"] - 1) // seq_len
             prime = config.magic_prime
