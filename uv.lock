@@ -11,7 +11,7 @@ resolution-markers = [
 ]
 
 [manifest]
-overrides = [{ name = "transformers", git = "https://github.com/rwkv-rs/transformers-rwkv.git?rev=63639d263e665fed8852d6c41da0889b0f6e3839" }]
+overrides = [{ name = "transformers", git = "https://github.com/rwkv-rs/transformers-rwkv.git?rev=ad26778904e680251588c4abfb0a544a1e1086f1" }]
 
 [[package]]
 name = "absl-py"
@@ -1856,7 +1856,7 @@ requires-dist = [
     { name = "shellcheck-py", marker = "extra == 'dev'", specifier = ">=0.10" },
     { name = "tokenizers", git = "https://github.com/rwkv-rs/tokenizers-rwkv.git?subdirectory=bindings%2Fpython&rev=c5d8dde5ff49c70e4656199d5033a84e03c21b2b" },
     { name = "torchtitan", git = "https://github.com/pytorch/torchtitan.git?rev=96276d86577cf3e3bd29de72586e76af62010a55" },
-    { name = "transformers", git = "https://github.com/rwkv-rs/transformers-rwkv.git?rev=63639d263e665fed8852d6c41da0889b0f6e3839" },
+    { name = "transformers", git = "https://github.com/rwkv-rs/transformers-rwkv.git?rev=ad26778904e680251588c4abfb0a544a1e1086f1" },
 ]
 provides-extras = ["dev"]
 
@@ -2082,7 +2082,7 @@ wheels = [
 [[package]]
 name = "transformers"
 version = "5.16.0.dev0"
-source = { git = "https://github.com/rwkv-rs/transformers-rwkv.git?rev=63639d263e665fed8852d6c41da0889b0f6e3839#63639d263e665fed8852d6c41da0889b0f6e3839" }
+source = { git = "https://github.com/rwkv-rs/transformers-rwkv.git?rev=ad26778904e680251588c4abfb0a544a1e1086f1#ad26778904e680251588c4abfb0a544a1e1086f1" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy" },

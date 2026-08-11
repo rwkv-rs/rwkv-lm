@@ -3,7 +3,7 @@
 | Component | Repository | Locked revision |
 |---|---|---|
 | TorchTitan | `pytorch/torchtitan` | `96276d86577cf3e3bd29de72586e76af62010a55` |
-| Transformers RWKV | `rwkv-rs/transformers-rwkv` | `63639d263e665fed8852d6c41da0889b0f6e3839` |
+| Transformers RWKV | `rwkv-rs/transformers-rwkv` | `ad26778904e680251588c4abfb0a544a1e1086f1` |
 | tokenizers-rwkv | `rwkv-rs/tokenizers-rwkv` | `c5d8dde5ff49c70e4656199d5033a84e03c21b2b` |
 | FlashRWKV2 | `rwkv-rs/FlashRWKV2` | `v0.1.0a6` / `255df16b85edeac69ce512bb4a5ad1122a11863d` |
 | PEFT | `huggingface/peft` | `v0.19.1` / `ba6a19060d6ab54a87538a6e77e3e4d5a907375b` |

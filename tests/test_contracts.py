@@ -515,14 +515,14 @@ def test_launcher_ignores_hostile_generic_environment_names() -> None:
 def test_dependency_manifest_has_no_floating_main() -> None:
     manifest = (Path(__file__).parents[1] / "pyproject.toml").read_text()
     assert "@main" not in manifest
-    assert "63639d263e665fed8852d6c41da0889b0f6e3839" in manifest
+    assert "ad26778904e680251588c4abfb0a544a1e1086f1" in manifest
     assert "flashrwkv2==0.1.0a6" in manifest
     lock = (Path(__file__).parents[1] / "uv.lock").read_text()
     assert "sha256:73d7ff2f055d03c0ae092a39e6387f8a372a320f31e6262a204a4eae9f2ec274" in lock
     assert "sha256:d2c0cf7c55fb3a6732c1e674fd9e3615719c685c2e0b50828e592c489e86eb29" in lock
     assert dependency_metadata() == {
         "torchtitan_oid": "96276d86577cf3e3bd29de72586e76af62010a55",
-        "transformers_oid": "63639d263e665fed8852d6c41da0889b0f6e3839",
+        "transformers_oid": "ad26778904e680251588c4abfb0a544a1e1086f1",
         "tokenizers_oid": "c5d8dde5ff49c70e4656199d5033a84e03c21b2b",
         "flashrwkv2_version": "0.1.0a6",
         "flashrwkv2_oid": "255df16b85edeac69ce512bb4a5ad1122a11863d",
