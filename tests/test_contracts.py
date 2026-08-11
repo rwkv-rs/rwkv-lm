@@ -27,6 +27,7 @@ from rwkv_trainer.export import (
     _dcp_model_state,
     _require_uniform_floating_dtype,
 )
+from rwkv_trainer.loss import RwkvL2WrapLoss
 from rwkv_trainer.model import PeftSettings, RwkvModelAdapter
 from rwkv_trainer.model_spec import model_registry
 from rwkv_trainer.optimizer import RwkvOptimizersContainer
@@ -479,6 +480,23 @@ def test_optimizer_grouping_matches_train_temp() -> None:
     assert groups["matrix.weight"]["weight_decay"] == 0.1
     assert groups["norm.weight"]["weight_decay"] == 0
     assert all(group["eps"] == 1e-18 for group in groups.values())
+
+
+@pytest.mark.parametrize("invalid", [-100, -1, 4])
+def test_l2wrap_rejects_masked_or_invalid_labels(invalid: int) -> None:
+    loss = RwkvL2WrapLoss(RwkvL2WrapLoss.Config())
+    logits = torch.zeros(1, 1, 4, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="masked or out-of-vocabulary"):
+        loss(logits, torch.tensor([[invalid]]), 1.0)
+
+
+def test_l2wrap_rejects_non_integer_or_misaligned_labels() -> None:
+    loss = RwkvL2WrapLoss(RwkvL2WrapLoss.Config())
+    logits = torch.zeros(1, 2, 4, dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match=r"torch\.long"):
+        loss(logits, torch.zeros(1, 2), 2.0)
+    with pytest.raises(ValueError, match="shapes"):
+        loss(logits, torch.zeros(1, 1, dtype=torch.long), 1.0)
 
 
 def test_no_duplicate_model_tokenizer_or_kernel_sources() -> None:

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as functional
 from transformers import RwkvConfig, RwkvForCausalLM, RwkvTrainingState
 
 from rwkv_trainer.loss import RwkvL2WrapLoss
@@ -94,6 +95,34 @@ def test_adapter_loss_gradients_and_optimizer_match_direct_hf(tmp_path: Path) ->
     _assert_model_close(direct, adapter.rwkv_model, compare_gradients=False)
 
 
+def test_l2wrap_matches_train_temp_value_and_gradient() -> None:
+    torch.manual_seed(2468)
+    logits = (torch.randn(2, 5, 256, device="cuda", dtype=torch.bfloat16) * 0.25).requires_grad_()
+    labels = torch.randint(0, 256, (2, 5), device="cuda")
+    global_valid_tokens = float(labels.numel() * 2)
+    loss_fn = RwkvL2WrapLoss(RwkvL2WrapLoss.Config())
+    actual_loss, _ = loss_fn(logits, labels, global_valid_tokens)
+    actual_loss.backward()
+    assert logits.grad is not None
+
+    reference = logits.detach().float().requires_grad_()
+    scale = labels.numel() / global_valid_tokens
+    reference_loss = functional.cross_entropy(reference.flatten(0, 1), labels.flatten()) * scale
+    reference_loss.backward()
+    assert reference.grad is not None
+    expected_gradient = reference.grad
+    maxima, indices = reference.detach().max(dim=-1, keepdim=True)
+    l2wrap = torch.zeros_like(reference).scatter_(
+        -1,
+        indices,
+        maxima * (1e-4 / global_valid_tokens),
+    )
+    expected_gradient = expected_gradient + l2wrap
+
+    torch.testing.assert_close(actual_loss.float(), reference_loss, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(logits.grad.float(), expected_gradient, atol=2e-2, rtol=2e-2)
+
+
 def test_infctx_chunk_state_tail_and_detach_contract(tmp_path: Path) -> None:
     torch.manual_seed(4321)
     config = _config()
@@ -135,6 +164,15 @@ def test_infctx_chunk_state_tail_and_detach_contract(tmp_path: Path) -> None:
     invalid.wkv = invalid.wkv.to(torch.bfloat16)
     with pytest.raises(TypeError, match=r"training_state\.wkv must have dtype"):
         adapter.forward_stateful(tokens[:, :1], invalid)
+
+    invalid_shape = initial.clone()
+    invalid_shape.time_mix_shift = invalid_shape.time_mix_shift[..., :-1]
+    with pytest.raises(ValueError, match=r"training_state\.time_mix_shift must have shape"):
+        adapter.forward_stateful(tokens[:, :1], invalid_shape)
+
+    invalid_batch = RwkvTrainingState.zeros(config, 2, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"training_state\.time_mix_shift must have shape"):
+        adapter.forward_stateful(tokens[:, :1], invalid_batch)
 
 
 def test_canonical_artifact_adapter_forward_matches_direct_hf() -> None:
