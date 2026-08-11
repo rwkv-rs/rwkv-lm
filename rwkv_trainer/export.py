@@ -148,9 +148,20 @@ def _export(args: argparse.Namespace, output: Path) -> None:
 
     merged_inference_validation = None
     if args.merge:
-        reloaded.to(device=args.device, dtype=torch.float16)
-        _require_uniform_floating_dtype(reloaded, torch.float16)
-        unmerged_inference = _inference_logits(reloaded, tokens, seed=args.seed)
+        # Reload the inference reference from the original FP16 base.  Reusing
+        # the BF16 training-validation model and casting it to FP16 would keep
+        # the earlier BF16 rounding and compare two different base models.
+        inference_reloaded = PeftModel.from_pretrained(
+            AutoModelForCausalLM.from_pretrained(
+                args.base_model,
+                local_files_only=True,
+                dtype=torch.float16,
+            ),
+            adapter_dir,
+            local_files_only=True,
+        ).to(device=args.device, dtype=torch.float16)
+        _require_uniform_floating_dtype(inference_reloaded, torch.float16)
+        unmerged_inference = _inference_logits(inference_reloaded, tokens, seed=args.seed)
 
         # Merge in FP32 so LoRA deltas smaller than a BF16 base-weight ULP are
         # not discarded. The canonical inference provider consumes FP16 model
