@@ -13,7 +13,7 @@ authors = [{name = "Caizus", email = "18930215187@163.com"}]
 dependencies = [
   "flashrwkv2==0.1.0a6",
   "numpy>=1.26",
-  "peft==0.18.0",
+  "peft==0.19.1",
   "safetensors>=0.4",
   "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python",
   "torchtitan @ git+https://github.com/pytorch/torchtitan.git@96276d86577cf3e3bd29de72586e76af62010a55",

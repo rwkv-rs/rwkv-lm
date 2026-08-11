@@ -526,8 +526,8 @@ def test_dependency_manifest_has_no_floating_main() -> None:
         "tokenizers_oid": "c5d8dde5ff49c70e4656199d5033a84e03c21b2b",
         "flashrwkv2_version": "0.1.0a6",
         "flashrwkv2_oid": "255df16b85edeac69ce512bb4a5ad1122a11863d",
-        "peft_version": "0.18.0",
-        "peft_oid": "abefcce659b892b42271831504b66f3f2340b655",
+        "peft_version": "0.19.1",
+        "peft_oid": "ba6a19060d6ab54a87538a6e77e3e4d5a907375b",
         "rwkv_peft_reference_oid": "5704c39f8ab1d2ac63936ab392aadb6ba526e1a5",
     }
     metadata = json.loads(json.dumps(model_registry("pretrain").model.to_dict()))

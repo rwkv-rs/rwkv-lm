@@ -6,7 +6,7 @@
 | Transformers RWKV | `rwkv-rs/transformers-rwkv` | `63639d263e665fed8852d6c41da0889b0f6e3839` |
 | tokenizers-rwkv | `rwkv-rs/tokenizers-rwkv` | `c5d8dde5ff49c70e4656199d5033a84e03c21b2b` |
 | FlashRWKV2 | `rwkv-rs/FlashRWKV2` | `v0.1.0a6` / `255df16b85edeac69ce512bb4a5ad1122a11863d` |
-| PEFT | `huggingface/peft` | `v0.18.0` / `abefcce659b892b42271831504b66f3f2340b655` |
+| PEFT | `huggingface/peft` | `v0.19.1` / `ba6a19060d6ab54a87538a6e77e3e4d5a907375b` |
 | RWKV-PEFT reference | `JL-er/RWKV-PEFT` | `5704c39f8ab1d2ac63936ab392aadb6ba526e1a5` |
 
 `uv.lock` fixes the published FlashRWKV2 source artifact and its hash. The upstream
