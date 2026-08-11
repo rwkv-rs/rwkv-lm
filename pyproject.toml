@@ -11,13 +11,13 @@ requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
 authors = [{name = "Caizus", email = "18930215187@163.com"}]
 dependencies = [
-  "flashrwkv2==0.1.0a5",
+  "flashrwkv2==0.1.0a6",
   "numpy>=1.26",
   "peft==0.18.0",
   "safetensors>=0.4",
   "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python",
   "torchtitan @ git+https://github.com/pytorch/torchtitan.git@96276d86577cf3e3bd29de72586e76af62010a55",
-  "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@10052072bd3ca172957d97e11b24ae297e0e0072",
+  "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@63639d263e665fed8852d6c41da0889b0f6e3839",
 ]
 
 [project.scripts]
@@ -50,4 +50,4 @@ include = ["rwkv_trainer"]
 reportMissingImports = false
 
 [tool.uv]
-override-dependencies = ["transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@10052072bd3ca172957d97e11b24ae297e0e0072"]
+override-dependencies = ["transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@63639d263e665fed8852d6c41da0889b0f6e3839"]
