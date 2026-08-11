@@ -22,7 +22,11 @@ from rwkv_trainer.config_registry import (
     rwkv7_pretrain,
     rwkv7_pretrain_infctx,
 )
-from rwkv_trainer.export import _dcp_model_state, _require_uniform_floating_dtype
+from rwkv_trainer.export import (
+    _assert_logits_close,
+    _dcp_model_state,
+    _require_uniform_floating_dtype,
+)
 from rwkv_trainer.model import PeftSettings, RwkvModelAdapter
 from rwkv_trainer.model_spec import model_registry
 from rwkv_trainer.optimizer import RwkvOptimizersContainer
@@ -542,3 +546,16 @@ def test_export_rejects_mixed_floating_dtypes() -> None:
         _require_uniform_floating_dtype(model, torch.bfloat16)
     model.fp32_buffer = model.fp32_buffer.to(torch.bfloat16)
     _require_uniform_floating_dtype(model, torch.bfloat16)
+
+
+def test_export_reports_strict_same_path_logit_error() -> None:
+    expected = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    actual = torch.tensor([1.01, 1.98], dtype=torch.float32)
+    stats = _assert_logits_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert stats == {
+        "elements": 2,
+        "max_absolute_difference": pytest.approx(0.02),
+        "max_relative_difference": pytest.approx(0.01),
+    }
+    with pytest.raises(AssertionError, match="not close"):
+        _assert_logits_close(torch.tensor([1.1]), torch.tensor([1.0]), atol=2e-2, rtol=2e-2)
