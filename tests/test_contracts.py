@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 from datetime import timedelta
 from pathlib import Path
@@ -25,6 +26,7 @@ from rwkv_trainer.config_registry import (
 from rwkv_trainer.export import (
     _assert_logits_close,
     _dcp_model_state,
+    _deterministic_cuda_validation,
     _require_uniform_floating_dtype,
 )
 from rwkv_trainer.loss import RwkvL2WrapLoss
@@ -577,3 +579,16 @@ def test_export_reports_strict_same_path_logit_error() -> None:
     }
     with pytest.raises(AssertionError, match="not close"):
         _assert_logits_close(torch.tensor([1.1]), torch.tensor([1.0]), atol=2e-2, rtol=2e-2)
+
+
+def test_export_deterministic_validation_is_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_enabled = torch.are_deterministic_algorithms_enabled()
+    original_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    with _deterministic_cuda_validation():
+        assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+        assert torch.are_deterministic_algorithms_enabled()
+        assert not torch.is_deterministic_algorithms_warn_only_enabled()
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
+    assert torch.are_deterministic_algorithms_enabled() == original_enabled
+    assert torch.is_deterministic_algorithms_warn_only_enabled() == original_warn_only

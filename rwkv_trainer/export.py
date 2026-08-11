@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -19,6 +21,25 @@ from .model import PeftSettings, RwkvModelAdapter
 from .provenance import artifact_hashes, dependency_metadata
 
 _BLOCK_KEY = re.compile(r"(\.blocks\.\d+)(\.)")
+
+
+@contextmanager
+def _deterministic_cuda_validation():
+    """Make repeated provider inference a strict artifact comparison oracle."""
+
+    workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        if workspace_config is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = workspace_config
 
 
 def _logits(model, tokens: torch.Tensor, *, seed: int) -> torch.Tensor:
@@ -251,7 +272,8 @@ def export(args: argparse.Namespace) -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     try:
-        _export(args, output)
+        with _deterministic_cuda_validation():
+            _export(args, output)
     except BaseException as error:
         failure = {
             "error_type": type(error).__name__,
