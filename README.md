@@ -29,3 +29,7 @@ shape always comes from the HF artifact given by `hf_assets_path`.
 Version provenance is recorded in [`DEPENDENCIES.md`](DEPENDENCIES.md). Unsupported
 in the first release: TP, PP, CP, MoE, RWKV-VL, SFT/masked labels, QLoRA,
 MiSS/DiSHA, PiSSA, AdaLoRA, prefix tuning, and state tuning.
+
+The current distinction between validated LoRA training artifacts and the
+remaining FP16 merged-inference parity limitation is recorded in
+[`docs/known-limitations.md`](docs/known-limitations.md).
